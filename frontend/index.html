@@ -1497,6 +1497,24 @@
 
     .temporary-command-item .command-detail { min-height: 0; }
 
+    /* 临时卡片为显式保存按钮预留空间，最小窗口下仍优先保证命令正文与操作可见。 */
+    .temporary-command-item .command-header {
+      grid-template-columns: 30px 38px minmax(130px, 0.7fr) minmax(180px, 1.3fr) auto;
+    }
+
+    .action-button.temporary-save-button {
+      border-color: var(--olive);
+      background: var(--olive);
+      color: #fffef8;
+      white-space: nowrap;
+    }
+
+    .action-button.temporary-save-button:hover:not(:disabled) {
+      border-color: #59623f;
+      background: #59623f;
+      color: #fffef8;
+    }
+
     .temporary-marker {
       display: grid;
       place-items: center;
@@ -1605,11 +1623,13 @@
       color: var(--ink-soft);
     }
 
-    .action-button:hover {
+    .action-button:hover:not(:disabled) {
       border-color: var(--paper-line);
       background: var(--paper-code);
       color: var(--ink);
     }
+
+    .action-button:disabled { cursor: not-allowed; opacity: 0.48; }
 
     .action-button.is-copied {
       border-color: #C9CCB2;
@@ -3177,6 +3197,9 @@
             </div>
             <code class="code-box">${escapeHtml(draft.command)}</code>
             <div class="command-actions">
+              <button class="action-button temporary-save-button" type="button" data-save-temporary-command="true" ${syncState.operation ? "disabled" : ""}>
+                ${icon("check")}<span>保存到当前分类</span>
+              </button>
               <button class="action-button copy-button" type="button" data-copy-temporary-command="true" aria-label="复制${escapeHtml(draft.title)}" title="复制">
                 ${icon("copy")}<span class="visually-hidden">复制</span>
               </button>
@@ -3417,11 +3440,12 @@
       render();
     });
 
-    /** 命令区点击委托：统一处理详情展开、命令与输出复制以及条目编辑。 */
+    /** 命令区点击委托：统一处理详情展开、临时结果保存、命令与输出复制以及条目编辑。 */
     commandList.addEventListener("click", async (event) => {
       const outputButton = event.target.closest("[data-output-id]");
       const copyButton = event.target.closest("[data-copy-id]");
       const copyOutputButton = event.target.closest("[data-copy-output-id]");
+      const saveTemporaryCommandButton = event.target.closest("[data-save-temporary-command]");
       const copyTemporaryCommandButton = event.target.closest("[data-copy-temporary-command]");
       const copyTemporaryOutputButton = event.target.closest("[data-copy-temporary-output]");
       const editButton = event.target.closest("[data-edit-id]");
@@ -3440,6 +3464,11 @@
           temporaryCommandExpanded = willExpand;
         } else if (willExpand) expandedCommandIds.add(commandId);
         else expandedCommandIds.delete(commandId);
+      }
+
+      if (saveTemporaryCommandButton) {
+        await saveTemporaryCommand();
+        return;
       }
 
       if (copyTemporaryCommandButton || copyTemporaryOutputButton) {
@@ -3480,6 +3509,63 @@
 
       if (editButton) openDrawer(editButton.dataset.editId, editButton);
     });
+
+    /**
+     * 把当前分类顶部的临时草稿转换为正式命令并插入首位；只有后端保存成功后才丢弃临时副本。
+     * @returns {Promise<void>} 保存成功、失败回滚或前置条件不满足时结束。
+     */
+    async function saveTemporaryCommand() {
+      const result = temporaryGenerationResult;
+      const category = getActiveCategory();
+      if (!syncState.repositoryAvailable || syncState.operation) {
+        showToastFeedback("当前正在保存或同步，请稍后再试", "error", 2200);
+        return;
+      }
+      if (result?.status !== "generated" || !result.draft || temporaryGenerationCategoryId !== category?.id) return;
+
+      const previousCategories = structuredClone(categories);
+      const previousActiveCategoryId = activeCategoryId;
+      const previousTemporaryCategoryId = temporaryGenerationCategoryId;
+      const previousTemporaryExpanded = temporaryCommandExpanded;
+      const draft = result.draft;
+      const commandId = isDesktopRuntime ? `command-${crypto.randomUUID()}` : `${category.id}-${Date.now()}`;
+
+      /* 正式 ID 只在用户确认保存时生成；数组首位就是 commands.json 与界面的共同顺序契约。 */
+      category.commands.unshift({
+        id: commandId,
+        title: draft.title,
+        code: draft.command,
+        note: [draft.description, draft.notes].filter(Boolean).join("\n"),
+        description: draft.description || "",
+        notes: draft.notes || "",
+        usage: draft.usage || draft.command,
+        parameters: Array.isArray(draft.parameters) ? draft.parameters : [],
+        outputExample: draft.outputExample,
+        risk: Boolean(draft.riskNote),
+        riskNote: draft.riskNote || ""
+      });
+      expandedCommandIds.add(commandId);
+      temporaryGenerationResult = null;
+      temporaryGenerationCategoryId = null;
+      render();
+
+      const saved = await persistDesktopMutation(previousCategories, previousActiveCategoryId, "临时命令已保存到当前分类首位");
+      if (!saved) {
+        /* 通用保存流程只负责回滚正式文档，此处补回尚未落盘的临时结果供用户再次确认。 */
+        temporaryGenerationResult = result;
+        temporaryGenerationCategoryId = previousTemporaryCategoryId;
+        temporaryCommandExpanded = previousTemporaryExpanded;
+        expandedCommandIds.delete(commandId);
+        render();
+      } else if (!isDesktopRuntime) {
+        showToastFeedback("临时命令已保存到当前分类首位");
+      }
+
+      const focusTarget = saved
+        ? commandList.querySelector(`[data-output-id="${commandId}"]`)
+        : commandList.querySelector("[data-save-temporary-command]");
+      restoreFocus([focusTarget, askCodexButton, addCommandButton, repositoryButton]);
+    }
 
     /**
      * 按命令 ID 查找当前渲染出的排序手柄；列表重绘后旧按钮会失效，因此不能长期保存 DOM 引用。
