@@ -216,6 +216,32 @@ async function main() {
       "正式命令加载完成",
     );
 
+    const unchangedRenderMutations = await evaluate(client.send, `(async () => {
+      const mutations = [];
+      const observer = new MutationObserver((records) => {
+        records.forEach((record) => {
+          mutations.push({
+            type: record.type,
+            target: record.target.id || record.target.getAttribute?.('data-command-id') || record.target.tagName,
+            attribute: record.attributeName || null
+          });
+        });
+      });
+      observer.observe(document.body, {
+        subtree: true,
+        attributes: true,
+        childList: true,
+        characterData: true
+      });
+      renderSync();
+      await Promise.resolve();
+      observer.disconnect();
+      return mutations;
+    })()`);
+    if (unchangedRenderMutations.length > 0) {
+      throw new Error(`同步状态没有变化时仍重写了 DOM：${JSON.stringify(unchangedRenderMutations)}`);
+    }
+
     await evaluate(client.send, `(() => {
       window.__cardBeforeCopy = document.querySelector('[data-command-id]');
       window.__copyButtonBeforeCopy = document.querySelector('[data-copy-id]');

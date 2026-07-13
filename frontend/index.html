@@ -2800,6 +2800,34 @@
       return { state: "synced", label: "已同步", meta: syncState.statusMessage || `上次同步：${syncState.lastSyncedText}` };
     }
 
+    /**
+     * 仅在文字发生变化时写入节点，避免 `textContent` 重设相同值仍替换文本节点。
+     * @param {HTMLElement} element 需要更新的现有界面节点。
+     * @param {string} value 目标文字。
+     */
+    function setTextIfChanged(element, value) {
+      if (element.textContent !== value) element.textContent = value;
+    }
+
+    /**
+     * 仅在属性发生变化时写入节点，避免相同同步状态反复触发样式和无障碍树更新。
+     * @param {HTMLElement} element 需要更新的现有界面节点。
+     * @param {string} name 属性名称。
+     * @param {string} value 目标属性值。
+     */
+    function setAttributeIfChanged(element, name, value) {
+      if (element.getAttribute(name) !== value) element.setAttribute(name, value);
+    }
+
+    /**
+     * 仅在禁用事实变化时修改控件，避免布尔属性重复写入引发无意义 DOM mutation。
+     * @param {HTMLButtonElement|HTMLInputElement|HTMLTextAreaElement} control 表单或操作控件。
+     * @param {boolean} disabled 目标禁用状态。
+     */
+    function setDisabledIfChanged(control, disabled) {
+      if (control.disabled !== disabled) control.disabled = disabled;
+    }
+
     /** 渲染同步区域；按钮禁用规则同时防止重复操作和无意义推送。 */
     function renderSync() {
       const view = getSyncView();
@@ -2807,28 +2835,30 @@
       const hasRepository = Boolean(syncState.repositoryPath);
       const hasUsableRepository = hasRepository && syncState.repositoryAvailable;
       const canMutateData = hasUsableRepository && !isBusy;
-      syncStatus.dataset.state = view.state;
-      syncStatusLabel.textContent = view.label;
-      syncMeta.textContent = view.meta;
-      syncPanel.setAttribute("aria-busy", String(isBusy));
-      repositoryButton.textContent = getRepositoryName(syncState.repositoryPath);
-      repositoryButton.title = hasRepository ? `${syncState.repositoryPath}；点击更换` : "选择本地数据仓库";
-      pullButton.textContent = syncState.operation === "pull" ? "拉取中…" : "拉取";
-      pushButton.textContent = syncState.operation === "push" ? "推送中…" : "推送";
-      pullButton.disabled = isBusy || !hasUsableRepository;
-      pushButton.disabled = isBusy || !hasUsableRepository || !syncState.hasLocalChanges;
-      repositoryButton.disabled = isBusy;
-      addCategoryButton.disabled = !canMutateData;
-      askCodexButton.disabled = !canMutateData || categories.length === 0;
-      copySortButton.disabled = !canMutateData || (getActiveCategory()?.commands.length || 0) < 2;
-      addCommandButton.disabled = !canMutateData || categories.length === 0;
+      setAttributeIfChanged(syncStatus, "data-state", view.state);
+      setTextIfChanged(syncStatusLabel, view.label);
+      setTextIfChanged(syncMeta, view.meta);
+      setAttributeIfChanged(syncPanel, "aria-busy", String(isBusy));
+      setTextIfChanged(repositoryButton, getRepositoryName(syncState.repositoryPath));
+      setAttributeIfChanged(repositoryButton, "title", hasRepository ? `${syncState.repositoryPath}；点击更换` : "选择本地数据仓库");
+      setTextIfChanged(pullButton, syncState.operation === "pull" ? "拉取中…" : "拉取");
+      setTextIfChanged(pushButton, syncState.operation === "push" ? "推送中…" : "推送");
+      setDisabledIfChanged(pullButton, isBusy || !hasUsableRepository);
+      setDisabledIfChanged(pushButton, isBusy || !hasUsableRepository || !syncState.hasLocalChanges);
+      setDisabledIfChanged(repositoryButton, isBusy);
+      setDisabledIfChanged(addCategoryButton, !canMutateData);
+      setDisabledIfChanged(askCodexButton, !canMutateData || categories.length === 0);
+      setDisabledIfChanged(copySortButton, !canMutateData || (getActiveCategory()?.commands.length || 0) < 2);
+      setDisabledIfChanged(addCommandButton, !canMutateData || categories.length === 0);
       [titleInput, codeInput, noteInput, parametersInput, outputExampleInput, riskInput, drawerSaveButton]
-        .forEach((control) => { control.disabled = !canMutateData; });
-      commandList.dataset.readonly = String(!canMutateData);
-      commandList.querySelectorAll("[data-edit-id]").forEach((button) => { button.disabled = !canMutateData; });
-      commandList.querySelectorAll("[data-sort-id]").forEach((button) => { button.disabled = !canMutateData; });
-      commandList.querySelectorAll("[data-copy-id]").forEach((button) => { button.disabled = !canMutateData; });
-      commandList.querySelectorAll("[data-command-id]").forEach((item) => { item.draggable = canMutateData; });
+        .forEach((control) => { setDisabledIfChanged(control, !canMutateData); });
+      setAttributeIfChanged(commandList, "data-readonly", String(!canMutateData));
+      commandList.querySelectorAll("[data-edit-id]").forEach((button) => { setDisabledIfChanged(button, !canMutateData); });
+      commandList.querySelectorAll("[data-sort-id]").forEach((button) => { setDisabledIfChanged(button, !canMutateData); });
+      commandList.querySelectorAll("[data-copy-id]").forEach((button) => { setDisabledIfChanged(button, !canMutateData); });
+      commandList.querySelectorAll("[data-command-id]").forEach((item) => {
+        if (item.draggable !== canMutateData) item.draggable = canMutateData;
+      });
     }
 
     /**
