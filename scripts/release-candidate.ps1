@@ -301,6 +301,7 @@ $targetTriple = "x86_64-pc-windows-msvc"
 $previousCargoTargetDirectory = $env:CARGO_TARGET_DIR
 $previousTempDirectory = $env:TEMP
 $previousTmpDirectory = $env:TMP
+$previousGitCeilingDirectories = $env:GIT_CEILING_DIRECTORIES
 $locationPushed = $false
 
 try {
@@ -312,6 +313,8 @@ try {
     $env:CARGO_TARGET_DIR = $resolvedTargetDirectory
     $env:TEMP = $resolvedRuntimeTempDirectory
     $env:TMP = $resolvedRuntimeTempDirectory
+    # 临时目录位于项目内部时，限制 Git 向上发现主仓库，确保“普通目录”测试仍处于独立边界；临时目录内的子仓库不受影响。
+    $env:GIT_CEILING_DIRECTORIES = $resolvedRuntimeTempDirectory
     Assert-CleanGitWorktree -RepositoryRoot $repositoryRoot
     $gitCommitBefore = (& git -C $repositoryRoot rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0) {
@@ -440,5 +443,11 @@ finally {
     }
     else {
         $env:TMP = $previousTmpDirectory
+    }
+    if ($null -eq $previousGitCeilingDirectories) {
+        Remove-Item Env:GIT_CEILING_DIRECTORIES -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:GIT_CEILING_DIRECTORIES = $previousGitCeilingDirectories
     }
 }
