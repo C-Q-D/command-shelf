@@ -1415,6 +1415,8 @@
       display: flex;
       flex: 0 0 auto;
       align-items: flex-start;
+      justify-content: flex-end;
+      flex-wrap: wrap;
       gap: 10px;
     }
 
@@ -1439,6 +1441,32 @@
     }
 
     .codex-entry-button:disabled {
+      cursor: not-allowed;
+      opacity: 0.42;
+    }
+
+    /* 次数排序属于用户主动整理动作，视觉层级低于新增命令但与 AI 入口保持一致。 */
+    .copy-sort-button {
+      min-width: 112px;
+      min-height: 50px;
+      margin-top: 8px;
+      padding: 0 15px;
+      border-color: var(--paper-line-strong);
+      border-radius: 5px;
+      background: var(--paper-raised);
+      color: var(--ink-soft);
+      font-family: var(--font-display);
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .copy-sort-button:hover:not(:disabled) {
+      border-color: var(--olive);
+      background: var(--olive-soft);
+      color: var(--olive);
+    }
+
+    .copy-sort-button:disabled {
       cursor: not-allowed;
       opacity: 0.42;
     }
@@ -1597,6 +1625,21 @@
     }
 
     .risk-badge { margin-left: 8px; }
+
+    .copy-count-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 21px;
+      margin-left: 8px;
+      padding: 0 7px;
+      border: 1px solid #DCE2DB;
+      border-radius: 999px;
+      background: #F8FAF6;
+      color: #778079;
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.02em;
+    }
 
     .code-box {
       min-width: 0;
@@ -2156,6 +2199,9 @@
           <button class="secondary-button codex-entry-button" id="ask-codex-button" type="button">
             <svg class="icon" aria-hidden="true"><use href="#icon-terminal"></use></svg>问 Codex
           </button>
+          <button class="secondary-button copy-sort-button" id="copy-sort-button" type="button" title="按复制次数从高到低排列当前分类">
+            按次数排序
+          </button>
           <button class="primary-button" id="add-command-button" type="button" data-od-id="add-command-button">
             <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>添加命令
           </button>
@@ -2319,7 +2365,7 @@
 
     /**
      * 页面数据：每个分类维护稳定的命令顺序；新增和排序只影响当前会话。
-     * 字段说明：icon 为页面内联图标名称，description 为分类用途，parameters 为结构化参数说明，outputExample 为必填的可信输出示例。
+     * 字段说明：copyCount 为命令正文成功复制并保存的累计次数，其余字段保持与 `commands.json` 契约一致。
      */
     let categories = [
       {
@@ -2496,6 +2542,7 @@
     const categoryDescription = document.getElementById("category-description");
     const addCategoryButton = document.getElementById("add-category-button");
     const askCodexButton = document.getElementById("ask-codex-button");
+    const copySortButton = document.getElementById("copy-sort-button");
     const addCommandButton = document.getElementById("add-command-button");
     const drawerLayer = document.getElementById("drawer-layer");
     const drawerTitle = document.getElementById("drawer-title");
@@ -2773,6 +2820,7 @@
       repositoryButton.disabled = isBusy;
       addCategoryButton.disabled = !canMutateData;
       askCodexButton.disabled = !canMutateData || categories.length === 0;
+      copySortButton.disabled = !canMutateData || (getActiveCategory()?.commands.length || 0) < 2;
       addCommandButton.disabled = !canMutateData || categories.length === 0;
       [titleInput, codeInput, noteInput, parametersInput, outputExampleInput, riskInput, drawerSaveButton]
         .forEach((control) => { control.disabled = !canMutateData; });
@@ -3286,6 +3334,7 @@
             <div class="command-heading">
               <h2 class="command-title" data-od-id="command-title-${command.id}">${escapeHtml(command.title)}</h2>
               ${command.risk ? '<span class="risk-badge">谨慎执行</span>' : ""}
+              <span class="copy-count-badge" data-copy-count-id="${command.id}">复制 ${command.copyCount || 0} 次</span>
             </div>
             <code class="code-box" data-od-id="command-code-${command.id}">${escapeHtml(command.code)}</code>
             <div class="command-actions">
@@ -3432,6 +3481,64 @@
       temporary.remove();
     }
 
+    /**
+     * 重新定位一条正式命令当前渲染出的复制按钮；保存快照会重绘列表，不能继续使用旧节点。
+     * @param {string} commandId 命令稳定 ID。
+     * @returns {HTMLElement|null} 当前分类仍可见时返回复制按钮，否则返回 null。
+     */
+    function findCommandCopyButton(commandId) {
+      return Array.from(commandList.querySelectorAll("[data-copy-id]"))
+        .find((button) => button.dataset.copyId === commandId) || null;
+    }
+
+    /**
+     * 复制正式命令正文，并在复制成功后把累计次数原子保存到 `commands.json`。
+     * @param {object} command 被复制的正式命令视图模型。
+     * @param {HTMLElement} originalButton 本次点击的复制按钮。
+     * @returns {Promise<void>} 复制与计数保存或明确降级提示完成后结束。
+     */
+    async function copyCommandAndRecord(command, originalButton) {
+      try {
+        await copyText(command.code);
+      } catch (error) {
+        showToastFeedback("复制失败，请手动选择命令", "error");
+        return;
+      }
+
+      /* 同步或其他保存进行中时仍保证核心复制可用，但不与正在持锁的文档操作争抢计数写入。 */
+      if (syncState.operation) {
+        showCopiedFeedback(originalButton, "命令已复制；当前操作进行中，本次未计数");
+        return;
+      }
+
+      const currentCount = Number.isSafeInteger(command.copyCount) && command.copyCount >= 0
+        ? command.copyCount
+        : 0;
+      if (currentCount >= Number.MAX_SAFE_INTEGER) {
+        showCopiedFeedback(originalButton, "命令已复制；复制次数已到计数上限");
+        return;
+      }
+
+      const previousCategories = structuredClone(categories);
+      const previousActiveCategoryId = activeCategoryId;
+      const nextCount = currentCount + 1;
+      command.copyCount = nextCount;
+      renderWorkspace();
+      renderSync();
+
+      const saved = await persistDesktopMutation(
+        previousCategories,
+        previousActiveCategoryId,
+        `命令已复制 · 累计 ${nextCount} 次`
+      );
+      const renderedButton = findCommandCopyButton(command.id);
+      const resultMessage = saved
+        ? `命令已复制 · 累计 ${nextCount} 次`
+        : "命令已复制，但复制次数未保存";
+      if (renderedButton) showCopiedFeedback(renderedButton, resultMessage);
+      else showToastFeedback(resultMessage, saved ? "success" : "error", 2400);
+    }
+
     /** 分类点击委托：切换后保持分类顺序稳定并立即刷新内容。 */
     categoryList.addEventListener("click", (event) => {
       const button = event.target.closest("[data-category-id]");
@@ -3488,12 +3595,8 @@
       if (copyButton) {
         const command = category.commands.find((item) => item.id === copyButton.dataset.copyId);
         if (!command) return;
-        try {
-          await copyText(command.code);
-          showCopiedFeedback(copyButton);
-        } catch (error) {
-          showToastFeedback("复制失败，请手动选择命令", "error");
-        }
+        await copyCommandAndRecord(command, copyButton);
+        return;
       }
 
       if (copyOutputButton) {
@@ -3542,7 +3645,8 @@
         parameters: Array.isArray(draft.parameters) ? draft.parameters : [],
         outputExample: draft.outputExample,
         risk: Boolean(draft.riskNote),
-        riskNote: draft.riskNote || ""
+        riskNote: draft.riskNote || "",
+        copyCount: 0
       });
       expandedCommandIds.add(commandId);
       temporaryGenerationResult = null;
@@ -3630,6 +3734,45 @@
     }
 
     /**
+     * 按复制次数从高到低稳定排列当前分类；次数相同的命令保持原有相对顺序。
+     * 该操作只响应用户点击，并复用现有原子保存与失败回滚，不会自动或定时重排。
+     * @returns {Promise<void>} 排序保存、无需变化提示或前置条件停止后结束。
+     */
+    async function sortCurrentCategoryByCopyCount() {
+      if (!syncState.repositoryAvailable || syncState.operation) {
+        showToastFeedback("当前正在保存或同步，暂时不能排序", "error", 2200);
+        return;
+      }
+      const category = getActiveCategory();
+      if (!category || category.commands.length < 2) return;
+
+      const sortedCommands = category.commands
+        .map((command, index) => ({ command, index }))
+        .sort((left, right) => {
+          const countDifference = (right.command.copyCount || 0) - (left.command.copyCount || 0);
+          return countDifference || left.index - right.index;
+        })
+        .map(({ command }) => command);
+      const orderChanged = sortedCommands.some((command, index) => command.id !== category.commands[index].id);
+      if (!orderChanged) {
+        showToastFeedback("当前顺序已经符合复制次数排序", "success", 2200);
+        restoreFocus([copySortButton, addCommandButton, repositoryButton]);
+        return;
+      }
+
+      const previousCategories = structuredClone(categories);
+      const previousActiveCategoryId = activeCategoryId;
+      category.commands.splice(0, category.commands.length, ...sortedCommands);
+      renderWorkspace();
+      renderSync();
+      try {
+        await persistDesktopMutation(previousCategories, previousActiveCategoryId, "已按复制次数从高到低排序");
+      } finally {
+        restoreFocus([copySortButton, addCommandButton, repositoryButton]);
+      }
+    }
+
+    /**
      * 排序手柄键盘入口仅响应 Alt+上/下方向键，避免覆盖普通列表浏览按键。
      * @param {KeyboardEvent} event 命令列表内冒泡的键盘事件。
      * @returns {void}
@@ -3686,6 +3829,8 @@
 
     /** Codex 入口只打开临时生成流程，不直接修改当前分类。 */
     askCodexButton.addEventListener("click", () => openCodexDialog(askCodexButton));
+    /** 次数排序只在用户明确点击时执行，不观察复制事件自动改变列表顺序。 */
+    copySortButton.addEventListener("click", () => { void sortCurrentCategoryByCopyCount(); });
     /** 新增命令入口始终作用于当前分类，并作为关闭抽屉后的明确焦点返回点。 */
     addCommandButton.addEventListener("click", () => openDrawer(null, addCommandButton));
     document.getElementById("drawer-close").addEventListener("click", closeDrawer);
@@ -3769,7 +3914,8 @@
           parameters,
           outputExample,
           risk: riskInput.checked,
-          riskNote: riskInput.checked ? "执行前请确认影响范围。" : ""
+          riskNote: riskInput.checked ? "执行前请确认影响范围。" : "",
+          copyCount: 0
         });
       }
 
@@ -3825,7 +3971,8 @@
           parameters: Array.isArray(command.parameters) ? command.parameters : [],
           outputExample: command.outputExample,
           risk: Boolean(command.riskNote),
-          riskNote: command.riskNote || ""
+          riskNote: command.riskNote || "",
+          copyCount: Number.isSafeInteger(command.copyCount) && command.copyCount >= 0 ? command.copyCount : 0
         }))
       }));
     }
@@ -3851,7 +3998,8 @@
             parameters: Array.isArray(command.parameters) ? command.parameters : [],
             outputExample: command.outputExample,
             riskNote: command.riskNote || "",
-            notes: command.notes || ""
+            notes: command.notes || "",
+            copyCount: Number.isSafeInteger(command.copyCount) && command.copyCount >= 0 ? command.copyCount : 0
           }))
         }))
       };

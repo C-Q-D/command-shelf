@@ -43,6 +43,9 @@ pub struct CommandEntry {
     /// 用户自己的补充经验或限制。
     #[serde(default)]
     pub notes: String,
+    /// 命令正文成功复制并完成本地保存的累计次数；旧数据缺失时从零开始。
+    #[serde(default)]
+    pub copy_count: u64,
 }
 
 /// Codex 生成且尚未保存到分类中的临时命令草稿。

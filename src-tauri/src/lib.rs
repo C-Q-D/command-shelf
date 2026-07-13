@@ -18,15 +18,15 @@ use codex_cli::{detect_codex_cli, generate_command_draft_with_retry, CodexCliSta
 use config_store::default_config_directory;
 use error::AppError;
 use model::{AppSnapshot, CommandDocument, CommandDraftGenerationResult};
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use tauri::State;
 
 /// Tauri 管理的运行期依赖；所有仓库写入和同步共享同一互斥门。
 struct RuntimeState {
     /// 负责机器配置、仓库和文档编排的用例服务。
-    app_service: AppService,
+    app_service: Arc<AppService>,
     /// 串行化仓库选择和文档写入，后端不能只依赖前端按钮禁用。
-    operation_lock: Mutex<()>,
+    operation_lock: Arc<Mutex<()>>,
 }
 
 /// 阻塞获取启动恢复锁；若此前线程异常退出，继续运行而不是让应用永久不可用。
@@ -48,6 +48,34 @@ fn try_lock_operations(operation_lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>,
             true,
         )),
     }
+}
+
+/// 在 Tauri 阻塞线程池中执行一次仓库网络操作，避免 Git 等待占用桌面事件线程。
+///
+/// 参数：`operation` 只能调用已经受控的应用服务方法，不得绕过仓库边界启动任意进程。
+/// 返回值：保留原业务结果；后台任务异常退出时转换为稳定的结构化错误。
+/// 副作用：闭包持有互斥门直到整个拉取或推送完成，因此保存与其他同步仍会被立即拒绝而不会排队。
+async fn run_repository_operation<F>(
+    app_service: Arc<AppService>,
+    operation_lock: Arc<Mutex<()>>,
+    operation: F,
+) -> Result<AppSnapshot, AppError>
+where
+    F: FnOnce(&AppService) -> Result<AppSnapshot, AppError> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = try_lock_operations(&operation_lock)?;
+        operation(&app_service)
+    })
+    .await
+    .map_err(|error| {
+        AppError::new(
+            "BACKGROUND_OPERATION_FAILED",
+            format!("同步后台任务异常结束：{error}"),
+            "确认应用仍在运行后重试；本地命令数据不会因此被删除。",
+            true,
+        )
+    })?
 }
 
 /// 恢复上次有效仓库；首次运行返回未配置快照而不是错误。
@@ -88,18 +116,26 @@ fn save_document(
 ///
 /// 副作用：会访问当前仓库的 `origin`；本地有修改、候选无效或分叉时不改变工作区。
 #[tauri::command]
-fn pull_repository(state: State<'_, RuntimeState>) -> Result<AppSnapshot, AppError> {
-    let _guard = try_lock_operations(&state.operation_lock)?;
-    state.app_service.pull_repository()
+async fn pull_repository(state: State<'_, RuntimeState>) -> Result<AppSnapshot, AppError> {
+    run_repository_operation(
+        Arc::clone(&state.app_service),
+        Arc::clone(&state.operation_lock),
+        |app_service| app_service.pull_repository(),
+    )
+    .await
 }
 
 /// 显式提交并普通推送当前命令数据，成功后返回重新计算的同步状态。
 ///
 /// 副作用：可能创建本地提交并访问 `origin`；不会暂存其他文件或使用强制推送。
 #[tauri::command]
-fn push_repository(state: State<'_, RuntimeState>) -> Result<AppSnapshot, AppError> {
-    let _guard = try_lock_operations(&state.operation_lock)?;
-    state.app_service.push_repository()
+async fn push_repository(state: State<'_, RuntimeState>) -> Result<AppSnapshot, AppError> {
+    run_repository_operation(
+        Arc::clone(&state.app_service),
+        Arc::clone(&state.operation_lock),
+        |app_service| app_service.push_repository(),
+    )
+    .await
 }
 
 /// 查询当前电脑上的 Codex CLI 是否可用，并返回版本或可执行的安装检查提示。
@@ -124,8 +160,8 @@ fn generate_command_draft(question: String) -> Result<CommandDraftGenerationResu
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let runtime_state = RuntimeState {
-        app_service: AppService::new(default_config_directory()),
-        operation_lock: Mutex::new(()),
+        app_service: Arc::new(AppService::new(default_config_directory())),
+        operation_lock: Arc::new(Mutex::new(())),
     };
     tauri::Builder::default()
         .manage(runtime_state)
@@ -144,10 +180,13 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    //! 测试职责：验证后端互斥门不会把用户重复操作排队到当前同步之后执行。
+    //! 测试职责：验证后端互斥门不会排队重复操作，仓库同步也不会占用调用线程。
 
-    use super::try_lock_operations;
-    use std::sync::Mutex;
+    use super::{run_repository_operation, try_lock_operations};
+    use crate::app_service::AppService;
+    use crate::model::AppSnapshot;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
 
     /// 验证已有操作持锁时返回稳定错误，释放后立即恢复可用。
     #[test]
@@ -161,5 +200,37 @@ mod tests {
 
         drop(active_guard);
         assert!(try_lock_operations(&operation_lock).is_ok());
+    }
+
+    /// 验证仓库操作闭包在阻塞线程池执行，防止同步 Git 调用重新占住桌面事件线程。
+    #[test]
+    fn runs_repository_operation_off_the_calling_thread() {
+        let directory = tempfile::tempdir().expect("应能创建后台操作测试目录");
+        let app_service = Arc::new(AppService::new(directory.path().join("config")));
+        let operation_lock = Arc::new(Mutex::new(()));
+        let calling_thread = thread::current().id();
+        let worker_thread = Arc::new(Mutex::new(None));
+        let captured_worker_thread = Arc::clone(&worker_thread);
+
+        let snapshot = tauri::async_runtime::block_on(run_repository_operation(
+            app_service,
+            operation_lock,
+            move |_| {
+                *captured_worker_thread.lock().expect("应能记录后台线程") =
+                    Some(thread::current().id());
+                Ok(AppSnapshot::unconfigured())
+            },
+        ))
+        .expect("后台仓库操作应成功返回");
+
+        assert!(snapshot.repository_path.is_none());
+        assert_ne!(
+            worker_thread
+                .lock()
+                .expect("应能读取后台线程")
+                .expect("后台闭包必须记录线程"),
+            calling_thread,
+            "仓库操作不得在调用线程内同步执行"
+        );
     }
 }

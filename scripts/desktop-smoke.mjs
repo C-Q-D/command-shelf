@@ -365,21 +365,48 @@ async function verifyLocalEditing(send) {
       window.__copiedValues = [];
       copyText = async (text) => { window.__copiedValues.push(text); };
       document.querySelector('[data-copy-id]').click();
-      document.querySelector('[data-copy-output-id]').click();
       return true;
     })()`,
   );
-  await waitForCondition(send, "window.__copiedValues?.length === 2", "命令与参考输出分别复制");
+  await waitForCondition(
+    send,
+    "window.__copiedValues?.length === 1 && document.querySelector('[data-copy-count-id]')?.textContent === '复制 1 次' && document.getElementById('sync-status-label')?.textContent === '本地有修改'",
+    "首条命令复制后计数保存",
+  );
+  await evaluate(send, "document.querySelector('[data-copy-output-id]').click(); true");
+  await waitForCondition(send, "window.__copiedValues?.length === 2", "参考输出复制但不增加命令次数");
+
+  await evaluate(send, "document.querySelectorAll('[data-copy-id]')[1].click(); true");
+  await waitForCondition(
+    send,
+    "window.__copiedValues?.length === 3 && document.querySelectorAll('[data-copy-count-id]')[1]?.textContent === '复制 1 次'",
+    "第二条命令第一次复制计数保存",
+  );
+  await evaluate(send, "document.querySelectorAll('[data-copy-id]')[1].click(); true");
+  await waitForCondition(
+    send,
+    "window.__copiedValues?.length === 4 && document.querySelectorAll('[data-copy-count-id]')[1]?.textContent === '复制 2 次'",
+    "第二条命令第二次复制计数保存",
+  );
+  await evaluate(send, "document.getElementById('copy-sort-button').click(); true");
+  await waitForCondition(
+    send,
+    "document.querySelector('.command-title')?.textContent === '查看全部运行进程' && document.querySelector('[data-copy-count-id]')?.textContent === '复制 2 次' && document.getElementById('sync-status-label')?.textContent === '本地有修改'",
+    "用户点击后按复制次数降序保存",
+  );
 
   const ui = await collectUi(send);
   const backend = await evaluate(send, "window.__TAURI__.core.invoke('load_app')");
   const copiedValues = await evaluate(send, "window.__copiedValues");
   const commands = backend.document?.categories?.[0]?.commands || [];
-  if (commands.length !== 2 || commands[0].title !== "查看磁盘使用量" || commands[1].title !== "查看全部运行进程") {
-    throw new Error(`后端文档没有保存编辑与排序结果：${JSON.stringify(backend)}`);
+  if (commands.length !== 2 || commands[0].title !== "查看全部运行进程" || commands[1].title !== "查看磁盘使用量") {
+    throw new Error(`后端文档没有保存编辑、复制次数与次数排序结果：${JSON.stringify(backend)}`);
   }
-  if (copiedValues[0] !== "df -h" || !copiedValues[1].startsWith("Filesystem")) {
-    throw new Error(`复制内容不符合当前首条命令：${JSON.stringify(copiedValues)}`);
+  if (commands[0].copyCount !== 2 || commands[1].copyCount !== 1) {
+    throw new Error(`命令复制次数没有按正文复制成功次数持久化：${JSON.stringify(commands)}`);
+  }
+  if (copiedValues[0] !== "df -h" || !copiedValues[1].startsWith("Filesystem") || copiedValues[2] !== "ps aux" || copiedValues[3] !== "ps aux") {
+    throw new Error(`命令与参考输出复制内容不符合预期：${JSON.stringify(copiedValues)}`);
   }
 
   await saveScreenshot(send);
@@ -419,7 +446,7 @@ async function verifyLocalRestart(send) {
   const ui = await collectUi(send);
   const backend = await evaluate(send, "window.__TAURI__.core.invoke('load_app')");
   const commands = backend.document?.categories?.[0]?.commands || [];
-  if (commands[0]?.title !== "查看磁盘使用量" || commands[1]?.title !== "查看全部运行进程") {
+  if (commands[0]?.title !== "查看全部运行进程" || commands[1]?.title !== "查看磁盘使用量") {
     throw new Error(`重启后的文档顺序不正确：${JSON.stringify(backend)}`);
   }
   return { ui, backend };

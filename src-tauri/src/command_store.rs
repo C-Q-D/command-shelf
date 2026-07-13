@@ -168,7 +168,10 @@ fn invalid_data(message: impl Into<String>) -> AppError {
 mod tests {
     //! 测试职责：锁定第一版文档版本、唯一 ID、必填字段和空初始化规则。
 
-    use super::{initialize_empty_document, load_document, validate_document};
+    use super::{
+        initialize_empty_document, load_document, parse_document_bytes, serialize_document,
+        validate_document,
+    };
     use crate::model::{CommandCategory, CommandDocument, CommandEntry};
 
     /// 构造包含一条完整命令的最小合法文档。
@@ -190,6 +193,7 @@ mod tests {
                     output_example: "USER PID COMMAND".to_string(),
                     risk_note: String::new(),
                     notes: String::new(),
+                    copy_count: 0,
                 }],
             }],
         }
@@ -240,5 +244,39 @@ mod tests {
         document.categories[0].commands[0].output_example = "  ".to_string();
         let error = validate_document(&document).expect_err("缺少参考输出应被拒绝");
         assert_eq!(error.code, "DATA_INVALID");
+    }
+
+    /// 验证旧版命令缺少复制计数字段时仍可加载，并从零开始统计。
+    #[test]
+    fn defaults_missing_copy_count_to_zero() {
+        let text = r#"{
+          "schemaVersion": 1,
+          "categories": [{
+            "id": "linux",
+            "name": "Linux",
+            "commands": [{
+              "id": "process",
+              "title": "查看进程",
+              "command": "ps aux",
+              "outputExample": "USER PID COMMAND"
+            }]
+          }]
+        }"#;
+
+        let (document, _) = parse_document_bytes(text.as_bytes()).expect("旧数据应继续兼容");
+        assert_eq!(document.categories[0].commands[0].copy_count, 0);
+    }
+
+    /// 验证复制次数会使用稳定的 camelCase 字段写回数据文件并可完整读回。
+    #[test]
+    fn persists_copy_count_in_version_one_document() {
+        let mut document = valid_document();
+        document.categories[0].commands[0].copy_count = 12;
+
+        let bytes = serialize_document(&document).expect("带复制次数的文档应可序列化");
+        let text = std::str::from_utf8(&bytes).expect("序列化结果应为 UTF-8");
+        assert!(text.contains("\"copyCount\": 12"));
+        let (reloaded, _) = parse_document_bytes(&bytes).expect("复制次数应可读回");
+        assert_eq!(reloaded, document);
     }
 }

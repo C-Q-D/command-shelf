@@ -563,6 +563,7 @@ mod tests {
                     output_example: "USER PID COMMAND".to_string(),
                     risk_note: String::new(),
                     notes: String::new(),
+                    copy_count: 0,
                 }],
             }],
         }
