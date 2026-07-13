@@ -2941,6 +2941,7 @@
       const previousCategories = structuredClone(categories);
       const previousActiveCategoryId = activeCategoryId;
       const wasEditing = Boolean(editingCommandId);
+      const submittedCommandId = editingCommandId;
 
       if (editingCommandId) {
         const command = category.commands.find((item) => item.id === editingCommandId);
@@ -2979,6 +2980,11 @@
       render();
       closeDrawer();
       await persistDesktopMutation(previousCategories, previousActiveCategoryId, wasEditing ? "命令修改已保存" : "命令已保存");
+      /* 桌面保存成功和失败回滚都会最终重绘列表，必须在此重新查找存活按钮，不能复用关闭抽屉时的旧节点。 */
+      const persistedEditButton = wasEditing
+        ? Array.from(commandList.querySelectorAll("[data-edit-id]")).find((button) => button.dataset.editId === submittedCommandId)
+        : null;
+      restoreFocus([persistedEditButton, addCommandButton, repositoryButton]);
     });
 
     /** 同步入口只触发显式操作，不在后台或页面加载时自动访问网络。 */
