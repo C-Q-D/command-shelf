@@ -50,12 +50,12 @@ fn try_lock_operations(operation_lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>,
     }
 }
 
-/// 在 Tauri 阻塞线程池中执行一次仓库网络操作，避免 Git 等待占用桌面事件线程。
+/// 在 Tauri 阻塞线程池中执行一次应用 I/O 操作，避免文件或 Git 等待占用桌面事件线程。
 ///
-/// 参数：`operation` 只能调用已经受控的应用服务方法，不得绕过仓库边界启动任意进程。
+/// 参数：`operation` 只能调用已经受控的应用服务方法，不得绕过数据仓库边界启动任意进程。
 /// 返回值：保留原业务结果；后台任务异常退出时转换为稳定的结构化错误。
-/// 副作用：闭包持有互斥门直到整个拉取或推送完成，因此保存与其他同步仍会被立即拒绝而不会排队。
-async fn run_repository_operation<F>(
+/// 副作用：闭包持有互斥门直到保存、拉取或推送完成，重叠请求仍会被立即拒绝而不会排队。
+async fn run_blocking_app_operation<F>(
     app_service: Arc<AppService>,
     operation_lock: Arc<Mutex<()>>,
     operation: F,
@@ -71,7 +71,7 @@ where
     .map_err(|error| {
         AppError::new(
             "BACKGROUND_OPERATION_FAILED",
-            format!("同步后台任务异常结束：{error}"),
+            format!("保存或同步后台任务异常结束：{error}"),
             "确认应用仍在运行后重试；本地命令数据不会因此被删除。",
             true,
         )
@@ -103,13 +103,17 @@ fn choose_repository(
 /// 参数：`expected_hash` 来自最近成功快照，用于检测应用外修改。
 /// 副作用：替换仓库中的 `commands.json`，但不创建 Git 提交或访问网络。
 #[tauri::command]
-fn save_document(
+async fn save_document(
     document: CommandDocument,
     expected_hash: String,
     state: State<'_, RuntimeState>,
 ) -> Result<AppSnapshot, AppError> {
-    let _guard = try_lock_operations(&state.operation_lock)?;
-    state.app_service.save_document(document, &expected_hash)
+    run_blocking_app_operation(
+        Arc::clone(&state.app_service),
+        Arc::clone(&state.operation_lock),
+        move |app_service| app_service.save_document(document, &expected_hash),
+    )
+    .await
 }
 
 /// 显式执行安全拉取，并在成功后返回重新校验的完整文档快照。
@@ -117,7 +121,7 @@ fn save_document(
 /// 副作用：会访问当前仓库的 `origin`；本地有修改、候选无效或分叉时不改变工作区。
 #[tauri::command]
 async fn pull_repository(state: State<'_, RuntimeState>) -> Result<AppSnapshot, AppError> {
-    run_repository_operation(
+    run_blocking_app_operation(
         Arc::clone(&state.app_service),
         Arc::clone(&state.operation_lock),
         |app_service| app_service.pull_repository(),
@@ -130,7 +134,7 @@ async fn pull_repository(state: State<'_, RuntimeState>) -> Result<AppSnapshot, 
 /// 副作用：可能创建本地提交并访问 `origin`；不会暂存其他文件或使用强制推送。
 #[tauri::command]
 async fn push_repository(state: State<'_, RuntimeState>) -> Result<AppSnapshot, AppError> {
-    run_repository_operation(
+    run_blocking_app_operation(
         Arc::clone(&state.app_service),
         Arc::clone(&state.operation_lock),
         |app_service| app_service.push_repository(),
@@ -180,9 +184,9 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    //! 测试职责：验证后端互斥门不会排队重复操作，仓库同步也不会占用调用线程。
+    //! 测试职责：验证后端互斥门不会排队重复操作，本地保存与仓库同步也不会占用调用线程。
 
-    use super::{run_repository_operation, try_lock_operations};
+    use super::{run_blocking_app_operation, try_lock_operations};
     use crate::app_service::AppService;
     use crate::model::AppSnapshot;
     use std::sync::{Arc, Mutex};
@@ -202,9 +206,9 @@ mod tests {
         assert!(try_lock_operations(&operation_lock).is_ok());
     }
 
-    /// 验证仓库操作闭包在阻塞线程池执行，防止同步 Git 调用重新占住桌面事件线程。
+    /// 验证应用 I/O 闭包在阻塞线程池执行，供本地保存和仓库同步共同复用。
     #[test]
-    fn runs_repository_operation_off_the_calling_thread() {
+    fn runs_blocking_app_operation_off_the_calling_thread() {
         let directory = tempfile::tempdir().expect("应能创建后台操作测试目录");
         let app_service = Arc::new(AppService::new(directory.path().join("config")));
         let operation_lock = Arc::new(Mutex::new(()));
@@ -212,7 +216,7 @@ mod tests {
         let worker_thread = Arc::new(Mutex::new(None));
         let captured_worker_thread = Arc::clone(&worker_thread);
 
-        let snapshot = tauri::async_runtime::block_on(run_repository_operation(
+        let snapshot = tauri::async_runtime::block_on(run_blocking_app_operation(
             app_service,
             operation_lock,
             move |_| {
