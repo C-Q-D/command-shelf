@@ -45,6 +45,31 @@ pub struct CommandEntry {
     pub notes: String,
 }
 
+/// Codex 单次生成且尚未保存到分类中的临时命令草稿。
+///
+/// 该契约故意不包含持久化 ID；只有用户确认保存时才由应用创建 ID 并写入 `commands.json`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommandDraft {
+    /// 用任务目的描述的简短标题。
+    pub title: String,
+    /// 可复制的完整命令正文；JSON 字段名固定为 `command`。
+    #[serde(rename = "command")]
+    pub command_text: String,
+    /// 命令解决的问题、适用环境或前提。
+    pub description: String,
+    /// 推荐用法或执行位置说明。
+    pub usage: String,
+    /// 结构化参数说明；没有额外参数时必须为空数组。
+    pub parameters: Vec<CommandParameter>,
+    /// 帮助用户判断结果形态的典型输出。
+    pub output_example: String,
+    /// 删除、覆盖或强制操作等风险提示；无额外风险时为空字符串。
+    pub risk_note: String,
+    /// 可由用户继续修改的补充说明；没有补充时为空字符串。
+    pub notes: String,
+}
+
 /// 一个位置稳定的命令分类。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

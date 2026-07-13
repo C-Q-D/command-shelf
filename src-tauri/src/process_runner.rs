@@ -2,7 +2,7 @@
 //! 主要内容：执行固定程序和参数，限制输出体积、施加超时，并在 Windows 上清理完整进程树。
 //! 重要约束：本模块不拼接 Shell 命令、不解释业务错误，也不在错误中记录程序参数或用户输入。
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -333,6 +333,13 @@ pub(crate) enum ProcessFailure {
         /// 管道返回的底层错误。
         source: std::io::Error,
     },
+    /// 向子进程标准输入写入固定请求时发生 I/O 错误。
+    Write {
+        /// 失败的固定流名称。
+        stream: &'static str,
+        /// 管道返回的底层错误。
+        source: std::io::Error,
+    },
     /// 进程超过调用方设置的时限，并已触发进程树清理。
     Timeout(Duration),
 }
@@ -405,6 +412,57 @@ pub(crate) fn run_process(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> Result<ProcessOutput, ProcessFailure> {
+    run_process_internal(
+        current_directory,
+        executable,
+        arguments,
+        environment,
+        None,
+        timeout,
+        stdout_limit,
+        stderr_limit,
+    )
+}
+
+/// 以标准输入传入有限请求并执行受控进程，避免把用户内容拼接进命令行参数。
+///
+/// 参数：`stdin_bytes` 会原样写入子进程标准输入并立即关闭管道；调用方必须自行限制输入大小。
+/// `capture_limits` 依次表示标准输出和标准错误的最大保留字节数。
+/// 返回值：与 [`run_process`] 相同，非零退出码仍交给业务模块分类。
+/// 副作用：会启动本机进程；写入失败、超时或正常退出后都会清理附着的进程树。
+pub(crate) fn run_process_with_stdin(
+    current_directory: &Path,
+    executable: &str,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+    stdin_bytes: &[u8],
+    timeout: Duration,
+    capture_limits: (usize, usize),
+) -> Result<ProcessOutput, ProcessFailure> {
+    run_process_internal(
+        current_directory,
+        executable,
+        arguments,
+        environment,
+        Some(stdin_bytes),
+        timeout,
+        capture_limits.0,
+        capture_limits.1,
+    )
+}
+
+/// 统一实现无输入与有限标准输入两种执行方式，确保两者共享完全相同的进程树边界。
+#[allow(clippy::too_many_arguments)]
+fn run_process_internal(
+    current_directory: &Path,
+    executable: &str,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+    stdin_bytes: Option<&[u8]>,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<ProcessOutput, ProcessFailure> {
     let mut command = Command::new(executable);
     command
         .args(arguments)
@@ -412,6 +470,9 @@ pub(crate) fn run_process(
         .envs(environment.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if stdin_bytes.is_some() {
+        command.stdin(Stdio::piped());
+    }
     configure_windows_process(&mut command);
     let mut child = command.spawn().map_err(ProcessFailure::Spawn)?;
     #[cfg(windows)]
@@ -433,6 +494,26 @@ pub(crate) fn run_process(
         .stderr
         .take()
         .expect("已配置管道的受控进程必须提供标准错误");
+    if let Some(stdin_bytes) = stdin_bytes {
+        let mut stdin = child
+            .stdin
+            .take()
+            .expect("请求标准输入的受控进程必须提供输入管道");
+        if let Err(source) = stdin.write_all(stdin_bytes) {
+            #[cfg(windows)]
+            if let Some(tree) = process_tree.take() {
+                tree.terminate();
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ProcessFailure::Write {
+                stream: "标准输入",
+                source,
+            });
+        }
+        // 显式关闭标准输入，让读取到 EOF 的非交互式 CLI 立即开始处理请求。
+        drop(stdin);
+    }
     let stdout_reader = thread::spawn(move || read_limited(stdout, stdout_limit));
     let stderr_reader = thread::spawn(move || read_limited(stderr, stderr_limit));
     let started_at = Instant::now();

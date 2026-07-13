@@ -102,6 +102,12 @@ fn process_failure(error: ProcessFailure) -> AppError {
             "检查系统 Git 后重试。",
             true,
         ),
+        ProcessFailure::Write { stream, source } => AppError::new(
+            "GIT_FAILED",
+            format!("无法写入 Git {stream}：{source}"),
+            "重新启动应用后重试。",
+            true,
+        ),
     }
 }
 
