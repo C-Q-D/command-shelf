@@ -4,6 +4,7 @@
 
 mod app_service;
 mod backup_store;
+mod codex_cli;
 mod command_store;
 mod config_store;
 mod error;
@@ -13,6 +14,7 @@ mod model;
 mod process_runner;
 
 use app_service::AppService;
+use codex_cli::{detect_codex_cli, CodexCliStatus};
 use config_store::default_config_directory;
 use error::AppError;
 use model::{AppSnapshot, CommandDocument};
@@ -100,6 +102,14 @@ fn push_repository(state: State<'_, RuntimeState>) -> Result<AppSnapshot, AppErr
     state.app_service.push_repository()
 }
 
+/// 查询当前电脑上的 Codex CLI 是否可用，并返回版本或可执行的安装检查提示。
+///
+/// 副作用：仅受控执行固定的 `codex --version`，不调用模型、不访问网络或命令数据。
+#[tauri::command]
+fn get_codex_cli_status() -> CodexCliStatus {
+    detect_codex_cli()
+}
+
 /// 启动 Tauri 桌面应用并注册经过显式授权的最小命令集合。
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -114,7 +124,8 @@ pub fn run() {
             choose_repository,
             save_document,
             pull_repository,
-            push_repository
+            push_repository,
+            get_codex_cli_status
         ])
         .run(tauri::generate_context!())
         .expect("CommandShelf 桌面应用启动失败");
