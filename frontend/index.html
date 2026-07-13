@@ -2379,6 +2379,7 @@
         .forEach((control) => { control.disabled = !canMutateData; });
       commandList.dataset.readonly = String(!canMutateData);
       commandList.querySelectorAll("[data-edit-id]").forEach((button) => { button.disabled = !canMutateData; });
+      commandList.querySelectorAll("[data-sort-id]").forEach((button) => { button.disabled = !canMutateData; });
       commandList.querySelectorAll("[data-command-id]").forEach((item) => { item.draggable = canMutateData; });
     }
 
@@ -2511,6 +2512,19 @@
       `).join("");
     }
 
+    /**
+     * 为排序手柄生成包含当前位置、总数、快捷键和边界状态的完整朗读标签。
+     * @param {object} command 当前命令视图模型。
+     * @param {number} index 当前命令从零开始的顺序索引。
+     * @param {number} total 当前分类中的命令总数。
+     * @returns {string} 可直接写入 aria-label 的中文操作说明。
+     */
+    function getSortHandleAriaLabel(command, index, total) {
+      const moveUpHint = index > 0 ? "按 Alt+上方向键上移" : "已在第一条，不能上移";
+      const moveDownHint = index < total - 1 ? "按 Alt+下方向键下移" : "已在最后一条，不能下移";
+      return `第 ${index + 1} 条，共 ${total} 条，“${command.title}”。${moveUpHint}；${moveDownHint}。`;
+    }
+
     /** 渲染当前分类的连续命令清单，并把展开条目组织为说明与输出双栏。 */
     function renderWorkspace() {
       const category = getActiveCategory();
@@ -2555,7 +2569,7 @@
             <button class="command-toggle" type="button" data-output-id="${command.id}" aria-expanded="${isOutputExpanded}" aria-controls="output-panel-${command.id}" aria-label="${isOutputExpanded ? "收起" : "展开"}${escapeHtml(command.title)}详情" data-od-id="output-toggle-${command.id}">
               ${icon("chevron")}
             </button>
-            <button class="drag-handle" type="button" title="拖动调整顺序" aria-label="${commandNumber}，拖动“${escapeHtml(command.title)}”调整顺序">${commandNumber}</button>
+            <button class="drag-handle" type="button" title="拖动调整顺序；键盘按 Alt+↑ 或 Alt+↓" data-sort-id="${command.id}" aria-label="${escapeHtml(getSortHandleAriaLabel(command, index, category.commands.length))}" data-od-id="sort-handle-${command.id}">${commandNumber}</button>
             <div class="command-heading">
               <h2 class="command-title" data-od-id="command-title-${command.id}">${escapeHtml(command.title)}</h2>
               ${command.risk ? '<span class="risk-badge">谨慎执行</span>' : ""}
@@ -2757,6 +2771,82 @@
       }
 
       if (editButton) openDrawer(editButton.dataset.editId, editButton);
+    });
+
+    /**
+     * 按命令 ID 查找当前渲染出的排序手柄；列表重绘后旧按钮会失效，因此不能长期保存 DOM 引用。
+     * @param {string} commandId 需要定位的命令 ID。
+     * @returns {HTMLElement|null} 当前命令的排序手柄；命令已不存在时返回 null。
+     */
+    function findSortHandle(commandId) {
+      return Array.from(commandList.querySelectorAll("[data-sort-id]"))
+        .find((button) => button.dataset.sortId === commandId) || null;
+    }
+
+    /**
+     * 在顺序重绘或保存回滚后把焦点归还同一命令的排序手柄，并为命令缺失场景保留安全回退。
+     * @param {string} commandId 需要恢复焦点的命令 ID。
+     * @returns {void}
+     */
+    function restoreSortHandleFocus(commandId) {
+      restoreFocus([findSortHandle(commandId), addCommandButton, repositoryButton]);
+    }
+
+    /**
+     * 使用键盘把一条命令移动一个位置，并复用桌面保存与失败回滚流程。
+     * @param {string} commandId 需要移动的命令 ID。
+     * @param {-1|1} direction -1 表示上移，1 表示下移。
+     * @returns {Promise<void>} 保存完成、失败回滚或边界提示结束后完成。
+     */
+    async function moveCommandByKeyboard(commandId, direction) {
+      if (!syncState.repositoryAvailable || syncState.operation) {
+        showToastFeedback("当前正在保存或同步，暂时不能调整顺序", "error", 2200);
+        return;
+      }
+      const category = getActiveCategory();
+      const fromIndex = category?.commands.findIndex((command) => command.id === commandId) ?? -1;
+      if (!category || fromIndex < 0) return;
+
+      const command = category.commands[fromIndex];
+      const targetIndex = fromIndex + direction;
+      if (targetIndex < 0 || targetIndex >= category.commands.length) {
+        /* 边界按键属于有效操作请求：保持原顺序和焦点，并通过现有 aria-live 反馈明确原因。 */
+        const boundary = direction < 0 ? "第一条，不能继续上移" : "最后一条，不能继续下移";
+        showToastFeedback(`“${command.title}”已在${boundary}`, "success", 2200);
+        return;
+      }
+
+      const previousCategories = structuredClone(categories);
+      const previousActiveCategoryId = activeCategoryId;
+      category.commands.splice(fromIndex, 1);
+      category.commands.splice(targetIndex, 0, command);
+      renderWorkspace();
+      renderSync();
+
+      const directionLabel = direction < 0 ? "上移" : "下移";
+      const resultMessage = `“${command.title}”已${directionLabel}至第 ${targetIndex + 1} 条，共 ${category.commands.length} 条`;
+      try {
+        const saved = await persistDesktopMutation(previousCategories, previousActiveCategoryId, resultMessage);
+        /* 浏览器预览不会由持久化函数显示成功消息，需在此补齐与桌面一致的 aria-live 结果反馈。 */
+        if (saved && !isDesktopRuntime) showToastFeedback(resultMessage);
+      } finally {
+        /* 保存成功会应用后端快照，失败会恢复旧快照；两条路径都必须重新定位同一命令。 */
+        restoreSortHandleFocus(commandId);
+      }
+    }
+
+    /**
+     * 排序手柄键盘入口仅响应 Alt+上/下方向键，避免覆盖普通列表浏览按键。
+     * @param {KeyboardEvent} event 命令列表内冒泡的键盘事件。
+     * @returns {void}
+     */
+    commandList.addEventListener("keydown", (event) => {
+      const handle = event.target.closest("[data-sort-id]");
+      const isMoveKey = event.key === "ArrowUp" || event.key === "ArrowDown";
+      if (!handle || !event.altKey || event.ctrlKey || event.metaKey || !isMoveKey) return;
+      event.preventDefault();
+      const direction = event.key === "ArrowUp" ? -1 : 1;
+      void moveCommandByKeyboard(handle.dataset.sortId, direction);
     });
 
     /** 拖拽排序：仅响应用户显式拖动，不根据使用频率自动重排。 */
