@@ -1,5 +1,5 @@
 //! 文件职责：定义第一版命令文档、界面快照与同步状态的数据契约。
-//! 主要内容：承载 `schemaVersion: 1` 的可同步数据和机器无关的前端响应模型。
+//! 主要内容：承载 `schemaVersion: 1` 的可同步数据、临时生成结果和前端响应模型。
 //! 重要约束：数组顺序就是用户顺序；稳定 ID 不得因重新排序而变化。
 
 use crate::error::AppError;
@@ -45,7 +45,7 @@ pub struct CommandEntry {
     pub notes: String,
 }
 
-/// Codex 单次生成且尚未保存到分类中的临时命令草稿。
+/// Codex 生成且尚未保存到分类中的临时命令草稿。
 ///
 /// 该契约故意不包含持久化 ID；只有用户确认保存时才由应用创建 ID 并写入 `commands.json`。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,6 +68,25 @@ pub struct CommandDraft {
     pub risk_note: String,
     /// 可由用户继续修改的补充说明；没有补充时为空字符串。
     pub notes: String,
+}
+
+/// 一次命令生成请求的前端响应；用带标签枚举保证成功与人工填写状态互斥。
+///
+/// 该结果只存在于内存和 Tauri 调用返回值中，不表示草稿已经写入 `commands.json`。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum CommandDraftGenerationResult {
+    /// Codex 返回了通过完整校验的结构化草稿，可直接作为顶部临时结果展示。
+    Generated {
+        /// 尚未分配持久化 ID 的命令草稿。
+        draft: CommandDraft,
+    },
+    /// 连续两次响应都无法解析，前端应展示原文并允许用户手动填写字段。
+    ManualEntryRequired {
+        /// 第二次 Codex 最终消息；可能为空，但不得替换为第一次响应。
+        #[serde(rename = "rawResponse")]
+        raw_response: String,
+    },
 }
 
 /// 一个位置稳定的命令分类。

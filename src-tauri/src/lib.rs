@@ -17,7 +17,7 @@ use app_service::AppService;
 use codex_cli::{detect_codex_cli, generate_command_draft_with_retry, CodexCliStatus};
 use config_store::default_config_directory;
 use error::AppError;
-use model::{AppSnapshot, CommandDocument, CommandDraft};
+use model::{AppSnapshot, CommandDocument, CommandDraftGenerationResult};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use tauri::State;
 
@@ -113,9 +113,10 @@ fn get_codex_cli_status() -> CodexCliStatus {
 /// 使用本机 Codex CLI 生成临时命令草稿，不保存到当前分类或数据文件。
 ///
 /// 参数：`question` 只作为标准输入传给固定的只读、临时 Codex 会话。
+/// 返回值：包含合法草稿，或连续两次无效后供前端人工填写的第二次原文。
 /// 副作用：响应无效时会新建一次会话重试；绝不执行生成命令或修改 `commands.json`。
 #[tauri::command]
-fn generate_command_draft(question: String) -> Result<CommandDraft, AppError> {
+fn generate_command_draft(question: String) -> Result<CommandDraftGenerationResult, AppError> {
     generate_command_draft_with_retry(&question)
 }
 

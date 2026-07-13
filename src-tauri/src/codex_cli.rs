@@ -3,7 +3,7 @@
 //! 重要约束：用户问题只经 stdin 传递；生成命令绝不执行，原始响应和本机细节不进入错误文本。
 
 use crate::error::AppError;
-use crate::model::CommandDraft;
+use crate::model::{CommandDraft, CommandDraftGenerationResult};
 use crate::process_runner::{run_process, run_process_with_stdin, ProcessFailure, ProcessOutput};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -118,16 +118,21 @@ pub(crate) fn detect_codex_cli() -> CodexCliStatus {
     detect_codex_cli_with_environment(&current_directory, &[])
 }
 
-/// 根据一个用户问题调用 Codex，并返回通过严格校验的临时命令草稿。
+/// 根据一个用户问题调用 Codex，并返回可展示的生成结果。
 ///
 /// 参数：问题不能为空且最多 2000 个字符；问题只通过标准输入发送，不进入命令行参数。
-/// 返回值：成功时不生成持久化 ID，也不写入 `commands.json`；失败时返回稳定中文错误。
+/// 返回值：合法草稿与二次无效后的人工填写状态都属于成功响应；其他故障返回稳定错误。
 /// 副作用：首次响应无效时会再启动一次全新的临时只读会话；其他失败不会重试。
-pub(crate) fn generate_command_draft_with_retry(question: &str) -> Result<CommandDraft, AppError> {
+pub(crate) fn generate_command_draft_with_retry(
+    question: &str,
+) -> Result<CommandDraftGenerationResult, AppError> {
     validate_question(question)?;
     let current_directory = env::temp_dir();
-    generate_command_draft_with_environment(question, &current_directory, &[])
-        .map_err(generation_failure_to_app_error)
+    finish_generation_result(generate_command_draft_with_environment(
+        question,
+        &current_directory,
+        &[],
+    ))
 }
 
 /// 使用可注入环境完成生成与一次条件重试；测试通过私有 PATH 避免真实网络和账号依赖。
@@ -263,7 +268,20 @@ fn invalid_response(raw_response: String) -> GenerationAttemptFailure {
     GenerationAttemptFailure::InvalidResponse { raw_response }
 }
 
-/// 把最终生成失败映射为当前前端可直接展示的稳定错误；不包含提示词和原始模型输出。
+/// 把内部尝试结果转换为互斥的前端契约；只有最终无效响应会进入人工填写状态。
+fn finish_generation_result(
+    result: Result<CommandDraft, GenerationAttemptFailure>,
+) -> Result<CommandDraftGenerationResult, AppError> {
+    match result {
+        Ok(draft) => Ok(CommandDraftGenerationResult::Generated { draft }),
+        Err(GenerationAttemptFailure::InvalidResponse { raw_response }) => {
+            Ok(CommandDraftGenerationResult::ManualEntryRequired { raw_response })
+        }
+        Err(failure) => Err(generation_failure_to_app_error(failure)),
+    }
+}
+
+/// 把需要报错的生成失败映射为稳定错误；无效响应分支仅作为内部误用的防御性兜底。
 fn generation_failure_to_app_error(failure: GenerationAttemptFailure) -> AppError {
     match failure {
         GenerationAttemptFailure::Process(ProcessFailure::Timeout(_)) => AppError::new(
@@ -429,11 +447,12 @@ mod tests {
     //! 测试职责：验证 CLI 探测、条件重试、提示词、安全事件和草稿 JSON 契约。
 
     use super::{
-        build_generation_prompt, detect_codex_cli_with_environment,
+        build_generation_prompt, detect_codex_cli_with_environment, finish_generation_result,
         generate_command_draft_with_environment, generate_command_draft_with_runner,
         invalid_response, validate_question, GenerationAttemptFailure, RETRY_CORRECTION,
     };
     use crate::model::CommandDraft;
+    use serde_json::Value;
     use std::fs;
     use tempfile::tempdir;
 
@@ -449,6 +468,49 @@ mod tests {
             risk_note: String::new(),
             notes: String::new(),
         }
+    }
+
+    /// 验证合法草稿映射为带 `generated` 标签的前端结果，字段仍使用既有 camelCase 契约。
+    #[test]
+    fn returns_tagged_generated_result() {
+        let response =
+            finish_generation_result(Ok(sample_draft())).expect("合法草稿应成为成功生成结果");
+        let value = serde_json::to_value(response).expect("生成结果应可序列化");
+
+        assert_eq!(value["status"], Value::String("generated".to_string()));
+        assert_eq!(
+            value["draft"]["command"],
+            Value::String("ls -la".to_string())
+        );
+        assert!(value.get("rawResponse").is_none());
+    }
+
+    /// 验证最终无效响应映射为人工填写状态，并原样保留第二次最终消息。
+    #[test]
+    fn returns_manual_entry_result_for_final_invalid_response() {
+        let response =
+            finish_generation_result(Err(invalid_response("第二次仍不是 JSON".to_string())))
+                .expect("最终内容无效应交给人工填写，而不是作为调用错误");
+        let value = serde_json::to_value(response).expect("人工填写结果应可序列化");
+
+        assert_eq!(
+            value["status"],
+            Value::String("manualEntryRequired".to_string())
+        );
+        assert_eq!(
+            value["rawResponse"],
+            Value::String("第二次仍不是 JSON".to_string())
+        );
+        assert!(value.get("draft").is_none());
+    }
+
+    /// 验证安全失败仍走稳定错误通道，不能被误当成人工可修正的内容问题。
+    #[test]
+    fn keeps_tool_use_as_generation_error() {
+        let error = finish_generation_result(Err(GenerationAttemptFailure::ToolUseDetected))
+            .expect_err("工具调用必须保持为拒绝错误");
+
+        assert_eq!(error.code, "CODEX_TOOL_USE_BLOCKED");
     }
 
     /// 验证首次无效响应会触发一次纠错会话，并采用第二次的合法草稿。
