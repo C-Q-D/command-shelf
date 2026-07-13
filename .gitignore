@@ -1,5 +1,6 @@
 # Rust 与 Tauri 本地构建缓存不进入源码仓库。
 /src-tauri/target/
+/.local/
 
 # Node 临时依赖与通用日志仅属于开发机。
 /node_modules/
