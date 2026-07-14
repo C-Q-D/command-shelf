@@ -18,7 +18,9 @@ use app_service::AppService;
 use codex_cli::{detect_codex_cli, generate_command_draft_with_retry, CodexCliStatus};
 use config_store::default_config_directory;
 use error::AppError;
-use model::{AppSnapshot, CommandDocument, CommandDraftGenerationResult, InboxSnapshot};
+use model::{
+    AppSnapshot, CommandDocument, CommandDraftGenerationResult, InboxDocument, InboxSnapshot,
+};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use tauri::State;
 
@@ -90,6 +92,24 @@ async fn load_inbox_document(state: State<'_, RuntimeState>) -> Result<InboxSnap
         Arc::clone(&state.app_service),
         Arc::clone(&state.operation_lock),
         |app_service| app_service.load_inbox_document(),
+    )
+    .await
+}
+
+/// 校验临时收集文档和磁盘基线，成功后在阻塞线程池中备份并原子保存。
+///
+/// 参数：`expected_hash` 来自最近一次成功读取或保存，用于检测应用外修改。
+/// 副作用：替换仓库中的 `inbox.json`，但不提交 Git、不访问网络。
+#[tauri::command]
+async fn save_inbox_document(
+    document: InboxDocument,
+    expected_hash: String,
+    state: State<'_, RuntimeState>,
+) -> Result<InboxSnapshot, AppError> {
+    run_blocking_app_operation(
+        Arc::clone(&state.app_service),
+        Arc::clone(&state.operation_lock),
+        move |app_service| app_service.save_inbox_document(document, &expected_hash),
     )
     .await
 }
@@ -188,6 +208,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_app,
             load_inbox_document,
+            save_inbox_document,
             choose_repository,
             save_document,
             pull_repository,

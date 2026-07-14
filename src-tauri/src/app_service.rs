@@ -2,7 +2,7 @@
 //! 主要内容：向 Tauri 命令提供稳定接口，并生成前端一次性消费的数据快照。
 //! 重要约束：启动恢复失败返回错误快照；主动连接失败返回 `Err`，两者都不覆盖原数据。
 
-use crate::backup_store::backup_document;
+use crate::backup_store::{backup_document, backup_inbox_document};
 use crate::command_store::{
     initialize_empty_document, load_document, serialize_document, validate_document,
 };
@@ -13,8 +13,11 @@ use crate::git_repository::{
     pull_repository as git_pull_repository, push_repository as git_push_repository,
     repository_has_local_changes, validate_repository, RepositoryInfo,
 };
-use crate::inbox_store::{initialize_empty_inbox_document, load_inbox_document};
-use crate::model::{AppSnapshot, CommandDocument, InboxSnapshot, SyncState};
+use crate::inbox_store::{
+    initialize_empty_inbox_document, load_inbox_document, serialize_inbox_document,
+    validate_inbox_document,
+};
+use crate::model::{AppSnapshot, CommandDocument, InboxDocument, InboxSnapshot, SyncState};
 use std::path::{Path, PathBuf};
 
 /// 桌面应用用例服务；配置目录可注入以支持隔离测试。
@@ -85,6 +88,50 @@ impl AppService {
             document,
             document_hash,
             initialized_empty_document: initialized,
+        })
+    }
+
+    /// 在外部基线未变化时备份并原子保存完整临时收集文档。
+    ///
+    /// 参数：`expected_hash` 必须来自最近一次成功读取或保存结果；不一致时拒绝覆盖磁盘。
+    /// 返回值：保存后重新读取并完整校验的文档和新哈希。
+    /// 副作用：在机器配置目录创建备份，并原子替换仓库中的 `inbox.json`；不访问 Git 或网络。
+    pub fn save_inbox_document(
+        &self,
+        document: InboxDocument,
+        expected_hash: &str,
+    ) -> Result<InboxSnapshot, AppError> {
+        validate_inbox_document(&document)?;
+        let config = load_config(&self.config_directory)?.ok_or_else(|| {
+            AppError::new(
+                "REPO_NOT_CONFIGURED",
+                "当前电脑尚未选择数据仓库。",
+                "先连接已经克隆到本机的个人数据仓库。",
+                false,
+            )
+        })?;
+        let repository = validate_repository(Path::new(&config.repository_path))?;
+        let inbox_path = repository.root.join("inbox.json");
+        let (_, current_hash) = load_inbox_document(&inbox_path)?;
+        if current_hash != expected_hash {
+            return Err(AppError::new(
+                "INBOX_BASELINE_CHANGED",
+                "inbox.json 已被其他程序或窗口修改，本次保存已停止。",
+                "重新加载临时收集内容，确认最新数据后再编辑。",
+                true,
+            ));
+        }
+
+        // 所有业务校验与基线检查必须先完成，备份成功后才允许原子替换正式文件。
+        let bytes = serialize_inbox_document(&document)?;
+        backup_inbox_document(&self.config_directory, &repository.root, &inbox_path)?;
+        atomic_write(&inbox_path, &bytes)?;
+
+        let (saved_document, saved_hash) = load_inbox_document(&inbox_path)?;
+        Ok(InboxSnapshot {
+            document: saved_document,
+            document_hash: saved_hash,
+            initialized_empty_document: false,
         })
     }
 
@@ -307,9 +354,10 @@ mod tests {
     use crate::command_store::{load_document, serialize_document};
     use crate::config_store::{save_config, AppConfig};
     use crate::git_repository::repository_has_local_changes;
-    use crate::model::InboxDocument;
+    use crate::inbox_store::serialize_inbox_document;
     use crate::model::SyncState;
     use crate::model::{CommandCategory, CommandDocument, CommandEntry};
+    use crate::model::{InboxDocument, InboxEntry};
     use std::fs;
     use std::net::TcpListener;
     #[cfg(unix)]
@@ -509,6 +557,121 @@ mod tests {
         assert_eq!(
             fs::read(repository.join("inbox.json")).expect("无效原文件应保留"),
             invalid_bytes
+        );
+    }
+
+    /// 构造安全保存测试使用的一条临时记录文档。
+    fn inbox_document(content: &str) -> InboxDocument {
+        InboxDocument {
+            schema_version: 1,
+            items: vec![InboxEntry {
+                id: "inbox-save-1".to_string(),
+                content: content.to_string(),
+                created_at: "2026-07-14T06:32:00.000Z".to_string(),
+                updated_at: "2026-07-14T07:00:00.000Z".to_string(),
+            }],
+        }
+    }
+
+    /// 验证临时收集保存会产生写入前备份、新哈希，并可由新服务实例完整恢复。
+    #[test]
+    fn saves_inbox_with_backup_and_restart_recovery() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        let config_directory = directory.path().join("config");
+        let service = AppService::new(config_directory.clone());
+        service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("测试仓库应能连接");
+        let loaded = service
+            .load_inbox_document()
+            .expect("首次读取应初始化空文档");
+        let original_bytes = fs::read(repository.join("inbox.json")).expect("应能读取原文件");
+
+        let saved = service
+            .save_inbox_document(inbox_document("稍后处理"), &loaded.document_hash)
+            .expect("合法临时收集文档应保存成功");
+
+        assert_eq!(saved.document.items[0].content, "稍后处理");
+        assert_ne!(saved.document_hash, loaded.document_hash);
+        let backup_files: Vec<_> = fs::read_dir(config_directory.join("backups"))
+            .expect("应能读取备份根目录")
+            .flat_map(|entry| {
+                fs::read_dir(entry.expect("仓库备份目录应有效").path()).expect("应能读取备份目录")
+            })
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("inbox."))
+            })
+            .collect();
+        assert_eq!(backup_files.len(), 1);
+        assert_eq!(
+            fs::read(backup_files[0].path()).expect("应能读取备份"),
+            original_bytes
+        );
+
+        let restarted = AppService::new(config_directory)
+            .load_inbox_document()
+            .expect("重启后应能恢复保存内容");
+        assert_eq!(restarted.document, saved.document);
+        assert_eq!(restarted.document_hash, saved.document_hash);
+    }
+
+    /// 验证外部修改哈希后拒绝陈旧保存，并完整保留外部写入内容。
+    #[test]
+    fn rejects_stale_inbox_hash_without_overwrite() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        let service = AppService::new(directory.path().join("config"));
+        service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("测试仓库应能连接");
+        let loaded = service
+            .load_inbox_document()
+            .expect("首次读取应初始化空文档");
+        let external_bytes =
+            serialize_inbox_document(&inbox_document("外部修改")).expect("外部测试文档应可序列化");
+        fs::write(repository.join("inbox.json"), &external_bytes).expect("应能模拟外部写入");
+
+        let error = service
+            .save_inbox_document(inbox_document("界面旧内容"), &loaded.document_hash)
+            .expect_err("陈旧哈希不得覆盖外部修改");
+
+        assert_eq!(error.code, "INBOX_BASELINE_CHANGED");
+        assert_eq!(
+            fs::read(repository.join("inbox.json")).expect("外部内容应保留"),
+            external_bytes
+        );
+    }
+
+    /// 验证备份目录不可创建时停止正式写入，最后一份有效临时收集文件保持不变。
+    #[test]
+    fn preserves_inbox_when_backup_creation_fails() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        let config_directory = directory.path().join("config");
+        let service = AppService::new(config_directory.clone());
+        service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("测试仓库应能连接");
+        let loaded = service
+            .load_inbox_document()
+            .expect("首次读取应初始化空文档");
+        let original_bytes = fs::read(repository.join("inbox.json")).expect("应能读取原文件");
+        fs::write(config_directory.join("backups"), "阻止创建备份目录")
+            .expect("应能制造稳定的备份失败条件");
+
+        let error = service
+            .save_inbox_document(inbox_document("不得写入"), &loaded.document_hash)
+            .expect_err("备份失败时保存必须停止");
+
+        assert_eq!(error.code, "BACKUP_FAILED");
+        assert_eq!(
+            fs::read(repository.join("inbox.json")).expect("原文件应保留"),
+            original_bytes
         );
     }
 
