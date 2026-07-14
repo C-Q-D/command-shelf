@@ -37,6 +37,9 @@
     }    /* 基础布局：桌面视口完全铺满，不额外模拟浏览器或设备边框。 */
     * { box-sizing: border-box; }
 
+    /* 统一落实原生 hidden 语义，避免组件自身的 flex/grid/display 样式让隐藏元素重新出现。 */
+    [hidden] { display: none !important; }
+
     html,
     body {
       width: 100%;
@@ -2117,6 +2120,103 @@
       background: var(--paper-danger);
     }
 
+    /* 临时收集固定入口与用户分类分区展示，视觉沿用现有侧栏选中态。 */
+    .inbox-nav {
+      padding: 4px 18px 20px;
+      border-bottom: 1px solid var(--paper-line);
+    }
+
+    .inbox-nav .category-button { width: 100%; }
+
+    /* 只读时间流保持纸面留白；新增、编辑和删除控件由后续原子独立接入。 */
+    .inbox-view {
+      min-width: 0;
+      margin: 24px 42px 48px 28px;
+    }
+
+    .inbox-view[hidden] { display: none; }
+
+    .inbox-state {
+      min-height: 240px;
+      display: grid;
+      place-items: center;
+      border-top: 1px solid var(--paper-line);
+      color: var(--ink-soft);
+      text-align: center;
+      line-height: 1.8;
+    }
+
+    .inbox-groups {
+      display: grid;
+      gap: 28px;
+    }
+
+    .inbox-group-title {
+      margin: 0 0 10px 16px;
+      color: var(--ink-soft);
+      font-family: var(--font-display);
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+    }
+
+    .inbox-items {
+      margin: 0;
+      padding: 0 0 0 30px;
+      border-left: 1px solid var(--paper-line-strong);
+      list-style: none;
+    }
+
+    .inbox-item {
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 28px;
+      align-items: start;
+      min-height: 58px;
+      padding: 16px 4px 16px 0;
+      border-bottom: 1px solid var(--paper-line);
+    }
+
+    .inbox-item:last-child { border-bottom-color: transparent; }
+
+    .inbox-marker {
+      position: absolute;
+      top: 22px;
+      left: -36px;
+      width: 11px;
+      height: 11px;
+      border: 1px solid var(--olive);
+      border-radius: 50%;
+      background: var(--paper);
+    }
+
+    .inbox-content {
+      margin: 0;
+      color: var(--ink);
+      font-family: var(--font-mono);
+      font-size: 14px;
+      line-height: 1.75;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+
+    .inbox-content a {
+      color: var(--olive-deep);
+      text-decoration-color: rgba(89, 100, 61, 0.38);
+      text-underline-offset: 3px;
+    }
+
+    .inbox-content a:hover { text-decoration-color: currentColor; }
+
+    .inbox-time {
+      padding-top: 2px;
+      color: var(--ink-faint);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
     @media (max-width: 1180px) {
       .app-shell { grid-template-columns: 250px minmax(0, 1fr); }
       .brand { padding-right: 28px; padding-left: 28px; }
@@ -2124,6 +2224,7 @@
       .workspace-header { padding-left: 34px; }
       .command-list,
       .empty-state { margin-right: 28px; margin-left: 16px; }
+      .inbox-view { margin-right: 28px; margin-left: 16px; }
       .command-header { grid-template-columns: 30px 38px minmax(160px, 0.8fr) minmax(240px, 1.3fr) auto; padding-right: 14px; }
       .command-detail { grid-template-columns: minmax(245px, 38%) minmax(0, 62%); }
       .detail-column { padding: 22px; }
@@ -2133,6 +2234,11 @@
       .command-toggle .icon { transition: none; }
       .sync-status[data-state="syncing"] .sync-status-dot,
       .codex-cli-status[data-state="checking"]::before { animation: none; }
+    }
+
+    @media (max-width: 1040px) {
+      .inbox-view { margin-right: 20px; margin-left: 12px; }
+      .inbox-item { gap: 16px; }
     }
   </style>
 </head>
@@ -2160,6 +2266,12 @@
         <p class="brand-mark"><span class="brand-glyph"><svg class="icon" aria-hidden="true"><use href="#icon-terminal"></use></svg></span>CommandShelf</p>
         <p class="brand-subtitle">个人命令记忆板</p>
       </header>
+      <nav class="inbox-nav" aria-label="临时收集">
+        <button class="category-button" id="inbox-nav-button" type="button" data-view="inbox">
+          <span class="category-name">临时收集</span>
+          <span class="category-count" id="inbox-nav-count">0</span>
+        </button>
+      </nav>
       <nav class="category-nav" data-od-id="category-navigation" aria-label="分类列表">
         <p class="nav-label">分类目录</p>
         <ul class="category-list" id="category-list"></ul>
@@ -2207,6 +2319,10 @@
           </button>
         </div>
       </header>
+      <section class="inbox-view" id="inbox-view" aria-label="临时收集记录" hidden>
+        <div class="inbox-state" id="inbox-state" hidden></div>
+        <div class="inbox-groups" id="inbox-groups"></div>
+      </section>
       <ol class="command-list" id="command-list" data-od-id="command-list"></ol>
       <section class="empty-state" id="empty-state" data-od-id="empty-category-state" hidden>
         <div class="empty-state-inner">
@@ -2484,6 +2600,32 @@
 
     /** 当前交互状态：默认进入 Linux，并仅展开首条 ps aux 的输出示例。 */
     let activeCategoryId = isDesktopRuntime ? null : "linux";
+    /** 固定临时收集入口是否为当前主视图；它不占用或伪造用户分类 ID。 */
+    let inboxViewActive = false;
+    /** 浏览器预览使用相对当前日期的稳定样例，桌面模式只接收 Rust 校验后的真实文档。 */
+    const previewInboxItems = (() => {
+      const timestamp = (daysAgo, hour, minute) => {
+        const value = new Date();
+        value.setHours(hour, minute, 0, 0);
+        value.setDate(value.getDate() - daysAgo);
+        return value.toISOString();
+      };
+      return [
+        { id: "preview-inbox-1", content: "试试这个 GitHub 项目，可能适合做终端文档预览\nhttps://github.com/charmbracelet/glow", createdAt: timestamp(0, 14, 32), updatedAt: timestamp(0, 14, 32) },
+        { id: "preview-inbox-2", content: "整理多台电脑上的 SSH 跳板机配置", createdAt: timestamp(0, 13, 7), updatedAt: timestamp(0, 13, 7) },
+        { id: "preview-inbox-3", content: "https://tauri.app/", createdAt: timestamp(0, 11, 48), updatedAt: timestamp(0, 11, 48) },
+        { id: "preview-inbox-4", content: "查一下 Rust 子进程超时后清理进程树的做法", createdAt: timestamp(1, 16, 21), updatedAt: timestamp(1, 16, 21) },
+        { id: "preview-inbox-5", content: "回顾命令卡片的复制统计交互", createdAt: timestamp(3, 9, 14), updatedAt: timestamp(3, 9, 14) }
+      ];
+    })();
+    /** 临时收集文档拥有独立哈希和加载状态，不能复用 commands.json 的保存基线。 */
+    const inboxState = {
+      items: isDesktopRuntime ? [] : previewInboxItems,
+      documentHash: null,
+      loaded: !isDesktopRuntime,
+      loading: false,
+      error: null
+    };
     let editingCommandId = null;
     let draggedCommandId = null;
     let toastTimer = null;
@@ -2518,7 +2660,7 @@
     /**
      * 页面侧同步状态由桌面后端快照更新；浏览器预览使用同一模型演示用户可见行为。
      * repositoryPath 属于机器配置，repositoryAvailable 区分“记住旧路径”和“当前可安全读写”。
-     * hasLocalChanges 表示 commands.json 已修改但尚未推送。
+     * hasLocalChanges 表示任一受管数据文件已修改但尚未推送。
      */
     const syncState = {
       repositoryPath: isDesktopRuntime ? "" : "D:\\CommandShelf\\command-data",
@@ -2544,9 +2686,14 @@
     let resolveCopyPreparationBarrier = null;
 
     /** DOM 引用集中声明，避免后续交互逻辑重复查询并保持职责清晰。 */
+    const inboxNavButton = document.getElementById("inbox-nav-button");
+    const inboxNavCount = document.getElementById("inbox-nav-count");
     const categoryList = document.getElementById("category-list");
     const commandList = document.getElementById("command-list");
     const emptyState = document.getElementById("empty-state");
+    const inboxView = document.getElementById("inbox-view");
+    const inboxStateMessage = document.getElementById("inbox-state");
+    const inboxGroups = document.getElementById("inbox-groups");
     const categoryTitle = document.getElementById("category-title");
     const categoryCount = document.getElementById("category-count");
     const categoryDescription = document.getElementById("category-description");
@@ -2783,7 +2930,7 @@
         return {
           state: "syncing",
           label: isLoading ? "正在加载…" : isSaving ? "正在保存…" : "正在连接…",
-          meta: syncState.statusMessage || (isSaving ? "正在安全写入 commands.json。" : "正在校验本地数据仓库。")
+          meta: syncState.statusMessage || (isSaving ? "正在安全写入本地数据文件。" : "正在校验本地数据仓库。")
         };
       }
       if (syncState.operation) {
@@ -2791,7 +2938,7 @@
         return {
           state: "syncing",
           label: isPulling ? "正在拉取…" : "正在推送…",
-          meta: isPulling ? "正在检查远端 commands.json。" : "正在保存、提交并推送本地修改。"
+          meta: isPulling ? "正在检查远端受管数据文件。" : "正在保存、提交并推送本地修改。"
         };
       }
       if (syncState.error) {
@@ -3151,6 +3298,74 @@
       showToastFeedback("人工整理的临时命令已生成");
     }
 
+    /** 清空当前机器仓库对应的临时收集缓存，仓库切换或拉取后必须重新读取。 */
+    function resetInboxState() {
+      inboxState.items = [];
+      inboxState.documentHash = null;
+      inboxState.loaded = false;
+      inboxState.loading = false;
+      inboxState.error = null;
+    }
+
+    /**
+     * 应用 Rust 后端返回的临时收集快照，不把它混入命令分类文档。
+     * @param {{document?: {items?: Array<object>}, documentHash?: string, initializedEmptyDocument?: boolean}} snapshot 后端临时收集快照。
+     * @returns {void}
+     */
+    function applyInboxSnapshot(snapshot) {
+      inboxState.items = Array.isArray(snapshot?.document?.items)
+        ? snapshot.document.items.map((item) => ({
+            id: String(item.id || ""),
+            content: String(item.content || ""),
+            createdAt: String(item.createdAt || ""),
+            updatedAt: String(item.updatedAt || "")
+          }))
+        : [];
+      inboxState.documentHash = snapshot?.documentHash || null;
+      inboxState.loaded = true;
+      inboxState.loading = false;
+      inboxState.error = null;
+      if (snapshot?.initializedEmptyDocument) {
+        syncState.hasLocalChanges = true;
+        syncState.statusMessage = "已创建空的 inbox.json，等待后续推送。";
+      }
+    }
+
+    /**
+     * 通过受控 Tauri 入口读取或首次初始化临时收集文档；浏览器预览保留本地样例。
+     * @param {{force?: boolean}} options 拉取成功后强制丢弃旧缓存并重新读取。
+     * @returns {Promise<void>} 文档加载或错误状态完成后结束。
+     */
+    async function loadInboxDocument({ force = false } = {}) {
+      if (!isDesktopRuntime || inboxState.loading || (inboxState.loaded && !force)) return;
+      if (!syncState.repositoryAvailable) {
+        inboxState.error = syncState.repositoryPath
+          ? "当前数据仓库不可用，请重新选择仓库。"
+          : "请先连接本地数据仓库。";
+        renderWorkspace();
+        return;
+      }
+
+      inboxState.loading = true;
+      inboxState.error = null;
+      syncState.operation = "load";
+      syncState.statusMessage = "正在读取并校验 inbox.json。";
+      render();
+      try {
+        const snapshot = await window.__TAURI__.core.invoke("load_inbox_document");
+        applyInboxSnapshot(snapshot);
+        syncState.operation = null;
+        render();
+      } catch (error) {
+        inboxState.loading = false;
+        inboxState.loaded = false;
+        inboxState.error = [error?.message, error?.action].filter(Boolean).join(" ") || "临时收集数据加载失败。";
+        syncState.operation = null;
+        syncState.statusMessage = "临时收集文件未通过校验，现有文件不会被覆盖。";
+        render();
+      }
+    }
+
     /**
      * 执行显式拉取或推送；桌面拉取调用 Rust 安全快进协议，浏览器预览保留短暂模拟。
      * @param {"pull"|"push"} operation 用户主动选择的同步操作。
@@ -3172,16 +3387,20 @@
         syncState.error = null;
         syncState.statusMessage = operation === "pull"
           ? "正在检查本地状态并抓取远端最新数据。"
-          : "正在校验范围、提交并普通推送 commands.json。";
+          : "正在校验范围、提交并普通推送两个受管数据文件。";
         renderSync();
         try {
           const snapshot = await window.__TAURI__.core.invoke(operation === "pull" ? "pull_repository" : "push_repository");
           applyDesktopSnapshot(snapshot, { preserveView: true });
+          if (operation === "pull") {
+            resetInboxState();
+            if (inboxViewActive) await loadInboxDocument({ force: true });
+          }
           showToastFeedback(snapshot.statusMessage);
         } catch (error) {
           syncState.operation = null;
           syncState.error = [error?.message, error?.action].filter(Boolean).join(" ") || `${operation === "pull" ? "拉取" : "推送"}失败，本地数据未改变。`;
-          syncState.statusMessage = `${operation === "pull" ? "拉取" : "推送"}已安全停止，本地命令仍可离线使用。`;
+          syncState.statusMessage = `${operation === "pull" ? "拉取" : "推送"}已安全停止，本地数据仍可离线使用。`;
           renderSync();
           showToastFeedback(`${operation === "pull" ? "拉取" : "推送"}已停止，本地数据未改变`, "error", 2800);
         }
@@ -3205,7 +3424,7 @@
         syncState.lastSyncedText = "刚刚";
         if (operation === "push") syncState.hasLocalChanges = false;
         renderSync();
-        showToastFeedback(operation === "pull" ? "已拉取最新命令" : "本地修改已推送");
+        showToastFeedback(operation === "pull" ? "已拉取最新数据" : "本地修改已推送");
       }, 900);
     }
 
@@ -3214,14 +3433,17 @@
      * @returns {object|null} 当前分类，顶层空文档返回 null。
      */
     function getActiveCategory() {
+      if (inboxViewActive) return null;
       return categories.find((category) => category.id === activeCategoryId) || categories[0] || null;
     }
 
     /** 渲染左侧分类，数量与命令数据实时同步。 */
     function renderCategories() {
+      inboxNavButton.setAttribute("aria-current", inboxViewActive ? "page" : "false");
+      inboxNavCount.textContent = String(inboxState.items.length);
       categoryList.innerHTML = categories.map((category) => `
         <li data-od-id="category-item-${category.id}">
-          <button class="category-button" type="button" data-category-id="${category.id}" ${category.id === activeCategoryId ? 'aria-current="page"' : ""}>
+          <button class="category-button" type="button" data-category-id="${category.id}" ${!inboxViewActive && category.id === activeCategoryId ? 'aria-current="page"' : ""}>
             ${icon(category.icon)}
             <span class="category-name">${escapeHtml(category.name)}</span>
             <span class="category-count">${category.commands.length}</span>
@@ -3328,8 +3550,113 @@
         </li>`;
     }
 
+    /**
+     * 把内容中的 HTTP(S) 地址转换为安全链接，其余文字保留原始换行。
+     * @param {string} content 临时记录原始内容。
+     * @returns {string} 已转义且仅允许 HTTP(S) 链接的 HTML。
+     */
+    function renderInboxContent(content) {
+      return String(content || "")
+        .split(/(https?:\/\/[^\s<>"']+)/giu)
+        .map((part) => /^https?:\/\//iu.test(part)
+          ? `<a href="${escapeHtml(part)}" target="_blank" rel="noreferrer">${escapeHtml(part)}</a>`
+          : escapeHtml(part))
+        .join("");
+    }
+
+    /**
+     * 根据本机日期生成分组键、标题和时间文本；无效时间以可见兜底展示而不打乱数组顺序。
+     * @param {string} createdAt UTC ISO 8601 创建时间。
+     * @returns {{key:string,label:string,time:string}} 时间流展示信息。
+     */
+    function getInboxDatePresentation(createdAt) {
+      const value = new Date(createdAt);
+      if (Number.isNaN(value.getTime())) return { key: "unknown", label: "更早", time: "时间未知" };
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const itemDay = new Date(value);
+      itemDay.setHours(0, 0, 0, 0);
+      const daysAgo = Math.round((today.getTime() - itemDay.getTime()) / 86400000);
+      const time = new Intl.DateTimeFormat("zh-CN", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false
+      }).format(value);
+      if (daysAgo === 0) return { key: "today", label: "今天", time };
+      if (daysAgo === 1) return { key: "yesterday", label: "昨天", time };
+      return {
+        key: `${value.getFullYear()}-${value.getMonth() + 1}-${value.getDate()}`,
+        label: `${value.getFullYear()}年${value.getMonth() + 1}月${value.getDate()}日`,
+        time
+      };
+    }
+
+    /** 按文件数组的连续顺序组织日期分组，绝不为视觉分组重新排序记录。 */
+    function groupInboxItems(items) {
+      return items.reduce((groups, item) => {
+        const presentation = getInboxDatePresentation(item.createdAt);
+        const current = groups.at(-1);
+        if (!current || current.key !== presentation.key) {
+          groups.push({ key: presentation.key, label: presentation.label, items: [] });
+        }
+        groups.at(-1).items.push({ item, time: presentation.time });
+        return groups;
+      }, []);
+    }
+
+    /** 渲染固定临时收集页的只读时间流、加载状态和空状态。 */
+    function renderInboxWorkspace() {
+      categoryTitle.textContent = "临时收集";
+      categoryCount.textContent = `${inboxState.items.length} 条`;
+      categoryDescription.textContent = "随手记，处理完就删掉。";
+      askCodexButton.hidden = true;
+      copySortButton.hidden = true;
+      addCommandButton.hidden = true;
+      commandList.hidden = true;
+      emptyState.hidden = true;
+      inboxView.hidden = false;
+
+      const stateText = inboxState.loading
+        ? "正在读取临时收集内容…"
+        : inboxState.error
+          ? inboxState.error
+          : inboxState.loaded && inboxState.items.length === 0
+            ? "还没有临时记录。后续可以从这里快速记下文字或链接。"
+            : "";
+      inboxStateMessage.hidden = !stateText;
+      inboxStateMessage.textContent = stateText;
+      inboxGroups.hidden = Boolean(stateText);
+      if (stateText) {
+        inboxGroups.innerHTML = "";
+        return;
+      }
+
+      inboxGroups.innerHTML = groupInboxItems(inboxState.items).map((group) => `
+        <section class="inbox-group" data-inbox-group="${escapeHtml(group.key)}">
+          <h2 class="inbox-group-title">${escapeHtml(group.label)}</h2>
+          <ol class="inbox-items">
+            ${group.items.map(({ item, time }) => `
+              <li class="inbox-item" data-inbox-id="${escapeHtml(item.id)}">
+                <span class="inbox-marker" aria-hidden="true"></span>
+                <p class="inbox-content">${renderInboxContent(item.content)}</p>
+                <time class="inbox-time" datetime="${escapeHtml(item.createdAt)}">${escapeHtml(time)}</time>
+              </li>
+            `).join("")}
+          </ol>
+        </section>
+      `).join("");
+    }
+
     /** 渲染当前分类的连续命令清单，并把展开条目组织为说明与输出双栏。 */
     function renderWorkspace() {
+      if (inboxViewActive) {
+        renderInboxWorkspace();
+        return;
+      }
+      inboxView.hidden = true;
+      askCodexButton.hidden = false;
+      copySortButton.hidden = false;
+      addCommandButton.hidden = false;
       const category = getActiveCategory();
       if (!category) {
         categoryTitle.textContent = syncState.repositoryAvailable ? "还没有分类" : "连接你的命令仓库";
@@ -3726,9 +4053,18 @@
     }
 
     /** 分类点击委托：切换后保持分类顺序稳定并立即刷新内容。 */
+    /** 固定入口切换到独立临时收集视图，桌面首次进入时按需读取真实文件。 */
+    inboxNavButton.addEventListener("click", () => {
+      if (inboxViewActive && (inboxState.loaded || inboxState.loading)) return;
+      inboxViewActive = true;
+      render();
+      void loadInboxDocument();
+    });
+
     categoryList.addEventListener("click", (event) => {
       const button = event.target.closest("[data-category-id]");
-      if (!button || button.dataset.categoryId === activeCategoryId) return;
+      if (!button || (!inboxViewActive && button.dataset.categoryId === activeCategoryId)) return;
+      inboxViewActive = false;
       activeCategoryId = button.dataset.categoryId;
       render();
     });
@@ -4250,6 +4586,7 @@
     function applyDesktopSnapshot(snapshot, { preserveView = false, renderMode = "full" } = {}) {
       const previousActiveCategoryId = activeCategoryId;
       const previousExpandedIds = new Set(expandedCommandIds);
+      const previousRepositoryPath = syncState.repositoryPath;
       categories = mapDesktopDocument(snapshot.document);
       activeCategoryId = preserveView && categories.some((category) => category.id === previousActiveCategoryId)
         ? previousActiveCategoryId
@@ -4262,6 +4599,7 @@
         expandedCommandIds.add(categories[0].commands[0].id);
       }
       applyDesktopSnapshotMetadata(snapshot);
+      if (previousRepositoryPath !== syncState.repositoryPath) resetInboxState();
       if (renderMode === "sync-only") renderSync();
       else render();
     }
@@ -4359,13 +4697,14 @@
       if (isDesktopRuntime) {
         const submitButton = repositoryForm.querySelector('[type="submit"]');
         syncState.operation = "connect";
-        syncState.statusMessage = "正在校验 Git 根目录、origin、上游与 commands.json。";
+        syncState.statusMessage = "正在校验 Git 根目录、origin、上游与受管数据文件。";
         repositoryError.textContent = "";
         submitButton.disabled = true;
         renderSync();
         try {
           const snapshot = await window.__TAURI__.core.invoke("choose_repository", { repositoryPath });
           applyDesktopSnapshot(snapshot);
+          if (inboxViewActive) await loadInboxDocument({ force: true });
           closeRepositoryDialog();
           showToastFeedback(snapshot.initializedEmptyDocument ? "已连接并创建空数据" : "数据仓库已连接");
         } catch (error) {
