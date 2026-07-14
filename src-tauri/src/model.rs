@@ -1,4 +1,4 @@
-//! 文件职责：定义第一版命令文档、界面快照与同步状态的数据契约。
+//! 文件职责：定义第一版命令文档、临时收集文档、界面快照与同步状态的数据契约。
 //! 主要内容：承载 `schemaVersion: 1` 的可同步数据、临时生成结果和前端响应模型。
 //! 重要约束：数组顺序就是用户顺序；稳定 ID 不得因重新排序而变化。
 
@@ -130,6 +130,53 @@ impl CommandDocument {
             categories: Vec::new(),
         }
     }
+}
+
+/// 临时收集页中一条按时间展示的文字或链接记录。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxEntry {
+    /// 正式保存后保持不变的记录 UUID；编辑内容时不得重新生成。
+    pub id: String,
+    /// 用户输入的原始文本；允许换行以及文字和链接混排。
+    pub content: String,
+    /// 首次保存时生成的 UTC ISO 8601 时间文本。
+    pub created_at: String,
+    /// 最近一次修改时生成的 UTC ISO 8601 时间文本；首次保存时与创建时间相同。
+    pub updated_at: String,
+}
+
+/// `inbox.json` 第一版根文档；记录数组顺序就是临时收集页的展示顺序。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxDocument {
+    /// 数据格式版本；第一版只接受整数 `1`。
+    pub schema_version: u32,
+    /// 按用户顺序保存的临时记录，新增行为将在后续原子中插入数组顶部。
+    #[serde(default)]
+    pub items: Vec<InboxEntry>,
+}
+
+impl InboxDocument {
+    /// 创建不含任何临时记录的第一版空文档。
+    pub fn empty() -> Self {
+        Self {
+            schema_version: 1,
+            items: Vec::new(),
+        }
+    }
+}
+
+/// 临时收集文档的独立读取结果，不提前改变现有应用快照与前端加载契约。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxSnapshot {
+    /// 最近一次通过完整校验的临时收集文档。
+    pub document: InboxDocument,
+    /// 当前 `inbox.json` 原始字节的 SHA-256，供后续安全保存原子检查基线。
+    pub document_hash: String,
+    /// 本次读取是否因文件原先不存在而创建了第一版空文档。
+    pub initialized_empty_document: bool,
 }
 
 /// 侧栏同步区域使用的互斥状态。

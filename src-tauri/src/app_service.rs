@@ -1,5 +1,5 @@
-//! 文件职责：编排机器配置、命令文档持久化与安全 Git 同步用例。
-//! 主要内容：向 Tauri 命令提供稳定接口，并生成前端一次性消费的完整快照。
+//! 文件职责：编排机器配置、命令与临时收集文档持久化及安全 Git 同步用例。
+//! 主要内容：向 Tauri 命令提供稳定接口，并生成前端一次性消费的数据快照。
 //! 重要约束：启动恢复失败返回错误快照；主动连接失败返回 `Err`，两者都不覆盖原数据。
 
 use crate::backup_store::backup_document;
@@ -13,7 +13,8 @@ use crate::git_repository::{
     pull_repository as git_pull_repository, push_repository as git_push_repository,
     repository_has_local_changes, validate_repository, RepositoryInfo,
 };
-use crate::model::{AppSnapshot, CommandDocument, SyncState};
+use crate::inbox_store::{initialize_empty_inbox_document, load_inbox_document};
+use crate::model::{AppSnapshot, CommandDocument, InboxSnapshot, SyncState};
 use std::path::{Path, PathBuf};
 
 /// 桌面应用用例服务；配置目录可注入以支持隔离测试。
@@ -55,6 +56,36 @@ impl AppService {
         };
         save_config(&self.config_directory, &config)?;
         Ok(snapshot)
+    }
+
+    /// 从当前已配置仓库读取临时收集文档，文件缺失时仅初始化一次空文档。
+    ///
+    /// 返回值：包含完整校验后的文档、原始字节哈希和本次是否初始化的标记。
+    /// 副作用：仅当仓库根目录缺少 `inbox.json` 时创建空文件；已有文件绝不被替换。
+    pub fn load_inbox_document(&self) -> Result<InboxSnapshot, AppError> {
+        let config = load_config(&self.config_directory)?.ok_or_else(|| {
+            AppError::new(
+                "REPO_NOT_CONFIGURED",
+                "当前电脑尚未选择数据仓库。",
+                "先连接已经克隆到本机的个人数据仓库。",
+                false,
+            )
+        })?;
+        let repository = validate_repository(Path::new(&config.repository_path))?;
+        let inbox_path = repository.root.join("inbox.json");
+        let initialized = if inbox_path.exists() {
+            false
+        } else {
+            initialize_empty_inbox_document(&inbox_path)?;
+            true
+        };
+        let (document, document_hash) = load_inbox_document(&inbox_path)?;
+
+        Ok(InboxSnapshot {
+            document,
+            document_hash,
+            initialized_empty_document: initialized,
+        })
     }
 
     /// 在外部基线未变化且 Git 状态可确认的前提下，备份并原子保存完整命令文档。
@@ -276,6 +307,7 @@ mod tests {
     use crate::command_store::{load_document, serialize_document};
     use crate::config_store::{save_config, AppConfig};
     use crate::git_repository::repository_has_local_changes;
+    use crate::model::InboxDocument;
     use crate::model::SyncState;
     use crate::model::{CommandCategory, CommandDocument, CommandEntry};
     use std::fs;
@@ -418,6 +450,66 @@ mod tests {
         assert_eq!(snapshot.sync_state, SyncState::Unconfigured);
         assert!(snapshot.document.categories.is_empty());
         assert!(snapshot.repository_path.is_none());
+    }
+
+    /// 验证未配置仓库时不能在任意目录创建临时收集文件。
+    #[test]
+    fn rejects_inbox_load_without_repository_config() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let service = AppService::new(directory.path().join("config"));
+
+        let error = service
+            .load_inbox_document()
+            .expect_err("未配置仓库时应拒绝读取临时收集文档");
+
+        assert_eq!(error.code, "REPO_NOT_CONFIGURED");
+    }
+
+    /// 验证首次读取创建空文件，后续服务实例保留原文件并返回相同哈希。
+    #[test]
+    fn initializes_and_reloads_inbox_document() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        let config_directory = directory.path().join("config");
+        let service = AppService::new(config_directory.clone());
+        service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("测试仓库应能连接");
+
+        let initialized = service
+            .load_inbox_document()
+            .expect("首次读取应初始化空文档");
+        assert!(initialized.initialized_empty_document);
+        assert_eq!(initialized.document, InboxDocument::empty());
+        assert!(repository.join("inbox.json").exists());
+
+        let reloaded = AppService::new(config_directory)
+            .load_inbox_document()
+            .expect("再次读取应保留现有文档");
+        assert!(!reloaded.initialized_empty_document);
+        assert_eq!(reloaded.document, initialized.document);
+        assert_eq!(reloaded.document_hash, initialized.document_hash);
+    }
+
+    /// 验证仓库中已有无效临时收集文件会报错，且不会被空文档初始化覆盖。
+    #[test]
+    fn rejects_invalid_existing_inbox_without_overwrite() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        let service = AppService::new(directory.path().join("config"));
+        service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("测试仓库应能连接");
+        let invalid_bytes = br#"{"schemaVersion":2,"items":[]}"#;
+        fs::write(repository.join("inbox.json"), invalid_bytes).expect("应能写入无效测试文件");
+
+        let error = service.load_inbox_document().expect_err("未知版本应被拒绝");
+
+        assert_eq!(error.code, "INBOX_UNSUPPORTED_SCHEMA");
+        assert_eq!(
+            fs::read(repository.join("inbox.json")).expect("无效原文件应保留"),
+            invalid_bytes
+        );
     }
 
     /// 验证机器配置损坏时启动快照保留结构化错误，而不是伪装成首次运行。

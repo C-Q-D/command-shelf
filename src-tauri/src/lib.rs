@@ -1,5 +1,5 @@
 //! 文件职责：组装 CommandShelf 后端模块、Tauri 状态与前端可调用命令。
-//! 主要内容：注册应用恢复、文档保存与 Git 同步接口，并启动单窗口桌面壳。
+//! 主要内容：注册应用恢复、命令与临时收集文档读取、保存及 Git 同步接口。
 //! 重要约束：前端只能调用显式注册的窄接口，不能获得任意文件或 Shell 能力。
 
 mod app_service;
@@ -10,6 +10,7 @@ mod config_store;
 mod error;
 mod file_io;
 mod git_repository;
+mod inbox_store;
 mod model;
 mod process_runner;
 
@@ -17,7 +18,7 @@ use app_service::AppService;
 use codex_cli::{detect_codex_cli, generate_command_draft_with_retry, CodexCliStatus};
 use config_store::default_config_directory;
 use error::AppError;
-use model::{AppSnapshot, CommandDocument, CommandDraftGenerationResult};
+use model::{AppSnapshot, CommandDocument, CommandDraftGenerationResult, InboxSnapshot};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use tauri::State;
 
@@ -55,13 +56,14 @@ fn try_lock_operations(operation_lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>,
 /// 参数：`operation` 只能调用已经受控的应用服务方法，不得绕过数据仓库边界启动任意进程。
 /// 返回值：保留原业务结果；后台任务异常退出时转换为稳定的结构化错误。
 /// 副作用：闭包持有互斥门直到保存、拉取或推送完成，重叠请求仍会被立即拒绝而不会排队。
-async fn run_blocking_app_operation<F>(
+async fn run_blocking_app_operation<T, F>(
     app_service: Arc<AppService>,
     operation_lock: Arc<Mutex<()>>,
     operation: F,
-) -> Result<AppSnapshot, AppError>
+) -> Result<T, AppError>
 where
-    F: FnOnce(&AppService) -> Result<AppSnapshot, AppError> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce(&AppService) -> Result<T, AppError> + Send + 'static,
 {
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = try_lock_operations(&operation_lock)?;
@@ -76,6 +78,20 @@ where
             true,
         )
     })?
+}
+
+/// 在阻塞线程池中读取或首次初始化当前仓库的临时收集文档。
+///
+/// 返回值：独立的临时收集快照，不改变现有应用启动快照和分类页面状态。
+/// 副作用：仓库缺少 `inbox.json` 时创建空文档；不保存已有记录，也不访问网络。
+#[tauri::command]
+async fn load_inbox_document(state: State<'_, RuntimeState>) -> Result<InboxSnapshot, AppError> {
+    run_blocking_app_operation(
+        Arc::clone(&state.app_service),
+        Arc::clone(&state.operation_lock),
+        |app_service| app_service.load_inbox_document(),
+    )
+    .await
 }
 
 /// 恢复上次有效仓库；首次运行返回未配置快照而不是错误。
@@ -171,6 +187,7 @@ pub fn run() {
         .manage(runtime_state)
         .invoke_handler(tauri::generate_handler![
             load_app,
+            load_inbox_document,
             choose_repository,
             save_document,
             pull_repository,
