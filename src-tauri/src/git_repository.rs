@@ -6,6 +6,7 @@
 use crate::command_store::parse_document_bytes;
 use crate::error::AppError;
 use crate::inbox_store::parse_inbox_document_bytes;
+use crate::model::{CommandDocument, InboxDocument};
 use crate::process_runner::{run_process, ProcessFailure, ProcessOutput};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,6 +44,38 @@ pub struct PushOutcome {
     pub committed: bool,
     /// 本次操作是否执行并成功完成了普通 `git push`。
     pub pushed: bool,
+}
+
+/// 固定在一次 Git 冲突时刻的三份受管数据快照。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryConflictSnapshot {
+    /// 双方分叉前的共同祖先提交 OID。
+    pub base_oid: String,
+    /// 自动提交本机受管数据后的本地提交 OID。
+    pub local_oid: String,
+    /// 本次 fetch 后固定并校验过的远端提交 OID。
+    pub upstream_oid: String,
+    /// 共同祖先中的命令文档。
+    pub base_commands: CommandDocument,
+    /// 本机提交中的命令文档。
+    pub local_commands: CommandDocument,
+    /// 固定远端提交中的命令文档。
+    pub remote_commands: CommandDocument,
+    /// 共同祖先中的临时收集文档；旧提交缺失时视为空文档。
+    pub base_inbox: InboxDocument,
+    /// 本机提交中的临时收集文档；旧提交缺失时视为空文档。
+    pub local_inbox: InboxDocument,
+    /// 固定远端提交中的临时收集文档；旧提交缺失时视为空文档。
+    pub remote_inbox: InboxDocument,
+}
+
+/// 受控 rebase 的两种健康结果：已经完成，或已退出并返回可供界面处理的冲突快照。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebasePreparationOutcome {
+    /// Git 已经无冲突完成 rebase。
+    Rebased,
+    /// Git 确认受管文件存在冲突，随后成功 `rebase --abort` 并恢复原本机提交。
+    Conflict(Box<RepositoryConflictSnapshot>),
 }
 
 /// Git 业务层沿用受控进程的有限捕获结果。
@@ -413,6 +446,139 @@ fn resolve_upstream_commit_oid(repository: &Path) -> Result<String, AppError> {
     Ok(oid)
 }
 
+/// 把任意受控提交表达式解析为完整 OID，并拒绝异常输出。
+fn resolve_commit_oid(
+    repository: &Path,
+    revision: &str,
+    operation: &str,
+) -> Result<String, AppError> {
+    let object = format!("{revision}^{{commit}}");
+    let output = require_success(
+        run_git(repository, &["rev-parse", "--verify", object.as_str()])?,
+        operation,
+    )?;
+    let oid = stdout_text(&output);
+    let supported_length = oid.len() == 40 || oid.len() == 64;
+    if supported_length && oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(oid);
+    }
+    Err(AppError::new(
+        "GIT_FAILED",
+        format!("{operation}返回了无法识别的提交 OID。"),
+        "在系统终端检查当前分支历史后重试。",
+        true,
+    ))
+}
+
+/// 解析本机提交与固定远端提交的共同祖先，作为三方语义合并的共同基线。
+fn resolve_merge_base_oid(
+    repository: &Path,
+    local_oid: &str,
+    upstream_oid: &str,
+) -> Result<String, AppError> {
+    let output = require_success(
+        run_git(repository, &["merge-base", local_oid, upstream_oid])?,
+        "解析同步共同基线",
+    )?;
+    let oid = stdout_text(&output);
+    let supported_length = oid.len() == 40 || oid.len() == 64;
+    if supported_length && oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(oid);
+    }
+    Err(AppError::new(
+        "GIT_DIVERGED",
+        "本机与远端没有可识别的共同同步基线。",
+        "确认两台电脑使用同一个数据仓库和分支后重试。",
+        false,
+    ))
+}
+
+/// 从固定提交读取并解析命令文档；调用方可用来源名称生成明确诊断。
+fn read_commit_command_document(
+    repository: &Path,
+    commit_oid: &str,
+    source: &str,
+) -> Result<CommandDocument, AppError> {
+    let object_spec = format!("{commit_oid}:commands.json");
+    let candidate = run_git(repository, &["show", object_spec.as_str()])?;
+    if !candidate.status.success() || candidate.stdout_truncated {
+        return Err(AppError::new(
+            "MERGE_DATA_INVALID",
+            format!("{source}中缺少可读取的 commands.json。"),
+            "重新连接仓库并生成新的冲突预览。",
+            false,
+        ));
+    }
+    parse_document_bytes(&candidate.stdout)
+        .map(|(document, _hash)| document)
+        .map_err(|error| {
+            AppError::new(
+                "MERGE_DATA_INVALID",
+                format!("{source}的 commands.json 无效：{}", error.message),
+                "修复对应数据后重新同步。",
+                false,
+            )
+        })
+}
+
+/// 从固定提交读取临时收集文档；兼容旧提交尚未创建 `inbox.json` 的情况。
+fn read_commit_inbox_document(
+    repository: &Path,
+    commit_oid: &str,
+    source: &str,
+) -> Result<InboxDocument, AppError> {
+    let listing = require_success(
+        run_git(
+            repository,
+            &["ls-tree", "--name-only", commit_oid, "--", "inbox.json"],
+        )?,
+        "检查冲突快照中的临时收集文件",
+    )?;
+    if stdout_text(&listing).is_empty() {
+        return Ok(InboxDocument::empty());
+    }
+    let object_spec = format!("{commit_oid}:inbox.json");
+    let candidate = run_git(repository, &["show", object_spec.as_str()])?;
+    if !candidate.status.success() || candidate.stdout_truncated {
+        return Err(AppError::new(
+            "MERGE_DATA_INVALID",
+            format!("{source}中的 inbox.json 无法读取。"),
+            "重新连接仓库并生成新的冲突预览。",
+            false,
+        ));
+    }
+    parse_inbox_document_bytes(&candidate.stdout)
+        .map(|(document, _hash)| document)
+        .map_err(|error| {
+            AppError::new(
+                "MERGE_DATA_INVALID",
+                format!("{source}的 inbox.json 无效：{}", error.message),
+                "修复对应数据后重新同步。",
+                false,
+            )
+        })
+}
+
+/// 从共同基线、本机提交和固定远端提交读取完整受管数据，形成不可变冲突会话。
+fn capture_repository_conflict(
+    repository: &Path,
+    base_oid: String,
+    local_oid: String,
+    upstream_oid: String,
+) -> Result<RepositoryConflictSnapshot, AppError> {
+    Ok(RepositoryConflictSnapshot {
+        base_commands: read_commit_command_document(repository, &base_oid, "共同基线")?,
+        local_commands: read_commit_command_document(repository, &local_oid, "本机提交")?,
+        remote_commands: read_commit_command_document(repository, &upstream_oid, "远端提交")?,
+        base_inbox: read_commit_inbox_document(repository, &base_oid, "共同基线")?,
+        local_inbox: read_commit_inbox_document(repository, &local_oid, "本机提交")?,
+        remote_inbox: read_commit_inbox_document(repository, &upstream_oid, "远端提交")?,
+        base_oid,
+        local_oid,
+        upstream_oid,
+    })
+}
+
 /// 从固定提交 OID 读取并校验必需的候选 `commands.json`，不改变当前工作区。
 fn validate_commit_command_document(repository: &Path, commit_oid: &str) -> Result<(), AppError> {
     let object_spec = format!("{commit_oid}:commands.json");
@@ -682,16 +848,36 @@ fn commit_managed_documents(repository: &Path) -> Result<bool, AppError> {
     Ok(true)
 }
 
-/// 把本地提交重放到固定且已校验的远端提交；冲突时中止 rebase 并恢复本地提交。
+/// 返回当前 rebase 中尚未解决的冲突路径；仅两个受管文件可进入应用内合并流程。
+fn unresolved_conflict_paths(repository: &Path) -> Result<Vec<String>, AppError> {
+    let output = require_success(
+        run_git(repository, &["diff", "--name-only", "--diff-filter=U"])?,
+        "检查受管文件冲突",
+    )?;
+    Ok(stdout_text(&output)
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// 尝试把本地提交重放到固定远端；受管文件冲突时退出 rebase 并返回三份固定快照。
 ///
-/// 该函数不解决冲突，也不使用强制或破坏性命令。若 Git 无法完成自动中止，会返回更高优先级的人工恢复提示。
-fn rebase_onto_validated_upstream(repository: &Path, upstream_oid: &str) -> Result<(), AppError> {
+/// 返回冲突前会确认只有 `commands.json` 或 `inbox.json` 未合并，并确保仓库已恢复到原本机提交。
+pub fn rebase_or_capture_conflict(
+    repository: &Path,
+    upstream_oid: &str,
+) -> Result<RebasePreparationOutcome, AppError> {
+    let local_oid = resolve_commit_oid(repository, "HEAD", "解析本机提交")?;
+    let base_oid = resolve_merge_base_oid(repository, &local_oid, upstream_oid)?;
     let output = run_git(repository, &["rebase", upstream_oid])?;
     if output.status.success() {
-        return Ok(());
+        return Ok(RebasePreparationOutcome::Rebased);
     }
 
     let original = command_failure(&output, "接入远端更新");
+    let conflicts = unresolved_conflict_paths(repository)?;
     let abort = run_git(repository, &["rebase", "--abort"])?;
     if !abort.status.success() {
         let cleanup = command_failure(&abort, "中止远端更新");
@@ -706,10 +892,41 @@ fn rebase_onto_validated_upstream(repository: &Path, upstream_oid: &str) -> Resu
         ));
     }
 
+    let only_managed_conflicts = !conflicts.is_empty()
+        && conflicts
+            .iter()
+            .all(|path| path == "commands.json" || path == "inbox.json");
+    if !only_managed_conflicts {
+        return Err(original);
+    }
+
+    let restored_oid = resolve_commit_oid(repository, "HEAD", "确认本机提交恢复")?;
+    if restored_oid != local_oid {
+        return Err(AppError::new(
+            "GIT_FAILED",
+            "退出 rebase 后本机分支没有恢复到原提交。",
+            "本地数据仍然保留；请在系统终端检查分支状态后重试。",
+            true,
+        ));
+    }
+    let snapshot =
+        capture_repository_conflict(repository, base_oid, local_oid, upstream_oid.to_string())?;
+    Ok(RebasePreparationOutcome::Conflict(Box::new(snapshot)))
+}
+
+/// 保留旧同步接口的安全停止行为，直到上层完成冲突窗口接入。
+fn rebase_onto_validated_upstream(repository: &Path, upstream_oid: &str) -> Result<(), AppError> {
+    if matches!(
+        rebase_or_capture_conflict(repository, upstream_oid)?,
+        RebasePreparationOutcome::Rebased
+    ) {
+        return Ok(());
+    }
+
     Err(AppError::new(
         "GIT_DIVERGED",
         "本地修改与远端更新存在冲突，自动同步已停止。",
-        "本地提交和数据均已保留；请在系统终端处理冲突后重试。",
+        "本地提交和数据均已保留；应用内冲突窗口接入后即可继续处理。",
         false,
     ))
 }
@@ -767,8 +984,8 @@ mod tests {
     //! 测试职责：确认仓库边界、Git 错误矩阵和超时终止都返回稳定结构化错误。
 
     use super::{
-        classify_git_failure, pull_repository_with_after_validation, run_git_process,
-        spawn_failure, validate_repository,
+        classify_git_failure, pull_repository_with_after_validation, rebase_or_capture_conflict,
+        run_git_process, spawn_failure, validate_repository, RebasePreparationOutcome,
     };
     use crate::command_store::load_document;
     use std::fs;
@@ -913,6 +1130,66 @@ mod tests {
         let (document, _) = load_document(&repository.join("commands.json"))
             .expect("工作区必须保留已校验的有效文档");
         assert_eq!(document.categories[0].commands[0].title, "已验证候选命令");
+    }
+
+    /// 验证受管文件 rebase 冲突会固定三方内容，并在返回预览前恢复干净的本机提交。
+    #[test]
+    fn captures_three_way_documents_and_aborts_rebase() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let (_remote, repository, producer) = pull_race_fixture(directory.path());
+        git(&repository, &["config", "user.name", "CommandShelf Test"]);
+        git(
+            &repository,
+            &["config", "user.email", "commandshelf-test@example.invalid"],
+        );
+        let base_oid = git_output(&repository, &["rev-parse", "HEAD"]);
+
+        fs::write(
+            repository.join("commands.json"),
+            document_json("本机修改命令"),
+        )
+        .expect("应能写入本机冲突版本");
+        git(&repository, &["add", "commands.json"]);
+        git(&repository, &["commit", "-m", "加入本机修改"]);
+        let local_oid = git_output(&repository, &["rev-parse", "HEAD"]);
+
+        fs::write(
+            producer.join("commands.json"),
+            document_json("远端修改命令"),
+        )
+        .expect("应能写入远端冲突版本");
+        git(&producer, &["add", "commands.json"]);
+        git(&producer, &["commit", "-m", "加入远端修改"]);
+        git(&producer, &["push"]);
+        git(&repository, &["fetch", "origin"]);
+        let upstream_oid = git_output(&repository, &["rev-parse", "@{u}"]);
+
+        let outcome = rebase_or_capture_conflict(&repository, &upstream_oid)
+            .expect("受管文件冲突应返回应用内预览");
+        let RebasePreparationOutcome::Conflict(snapshot) = outcome else {
+            panic!("同一字段不同修改必须形成冲突快照");
+        };
+
+        assert_eq!(snapshot.base_oid, base_oid);
+        assert_eq!(snapshot.local_oid, local_oid);
+        assert_eq!(snapshot.upstream_oid, upstream_oid);
+        assert_eq!(
+            snapshot.base_commands.categories[0].commands[0].title,
+            "本地初始命令"
+        );
+        assert_eq!(
+            snapshot.local_commands.categories[0].commands[0].title,
+            "本机修改命令"
+        );
+        assert_eq!(
+            snapshot.remote_commands.categories[0].commands[0].title,
+            "远端修改命令"
+        );
+        assert!(snapshot.base_inbox.items.is_empty());
+        assert_eq!(git_output(&repository, &["rev-parse", "HEAD"]), local_oid);
+        assert_eq!(git_output(&repository, &["status", "--porcelain"]), "");
+        assert!(!repository.join(".git").join("rebase-merge").exists());
+        assert!(!repository.join(".git").join("rebase-apply").exists());
     }
 
     /// 验证系统找不到 Git 时不会退化成含糊的通用错误。
