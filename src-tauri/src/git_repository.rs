@@ -27,11 +27,13 @@ pub struct RepositoryInfo {
     pub name: String,
 }
 
-/// 一次拉取是否实际推进了本地分支。
+/// 一次拉取产生的远端接入与本地待推送状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PullOutcome {
-    /// `true` 表示本地 `HEAD` 已快进到新的上游提交。
+    /// `true` 表示本地 `HEAD` 已快进或重放到新的上游提交。
     pub updated: bool,
+    /// `true` 表示拉取结束后仍有本地提交等待用户主动推送。
+    pub has_local_changes: bool,
 }
 
 /// 一次推送是否创建了提交并实际访问远端。
@@ -379,34 +381,6 @@ pub fn repository_has_local_changes(repository: &Path) -> Result<bool, AppError>
     Ok(local_ahead_count(repository)? > 0)
 }
 
-/// 拉取前要求整个专用数据仓库干净，避免 Git 快进被其他文件阻塞。
-fn ensure_clean_worktree(repository: &Path) -> Result<(), AppError> {
-    let output = require_success(
-        run_git(
-            repository,
-            &["status", "--porcelain=v1", "--untracked-files=all"],
-        )?,
-        "检查仓库工作区",
-    )?;
-    if !stdout_text(&output).is_empty() {
-        return Err(AppError::new(
-            "LOCAL_CHANGES",
-            "本地仓库还有未提交修改，拉取已停止。",
-            "先推送 CommandShelf 本地修改，或在系统终端处理其他文件后重试。",
-            false,
-        ));
-    }
-    if local_ahead_count(repository)? > 0 {
-        return Err(AppError::new(
-            "LOCAL_COMMITS",
-            "当前分支还有尚未推送的本地提交，拉取已停止。",
-            "先推送本地提交，再拉取远端更新。",
-            false,
-        ));
-    }
-    Ok(())
-}
-
 /// 判断第一个提交是否为第二个提交的祖先；退出码 1 表示关系不成立而不是执行失败。
 fn is_ancestor(repository: &Path, ancestor: &str, descendant: &str) -> Result<bool, AppError> {
     let output = run_git(
@@ -515,7 +489,7 @@ fn validate_commit_documents(repository: &Path, commit_oid: &str) -> Result<(), 
     validate_commit_inbox_document(repository, commit_oid)
 }
 
-/// 执行显式安全拉取：先检查本地，再 fetch，校验远端候选，最后只允许快进。
+/// 执行显式安全拉取：先提交受管数据，再校验并接入固定远端提交，保留待推送的本地提交。
 pub fn pull_repository(repository: &Path) -> Result<PullOutcome, AppError> {
     pull_repository_with_after_validation(repository, || Ok(()))
 }
@@ -528,7 +502,11 @@ fn pull_repository_with_after_validation<F>(
 where
     F: FnOnce() -> Result<(), AppError>,
 {
-    ensure_clean_worktree(repository)?;
+    ensure_empty_index(repository)?;
+    ensure_no_unrelated_changes(repository)?;
+    let ahead_before_commit = local_ahead_count(repository)?;
+    let committed = commit_managed_documents(repository)?;
+    let has_local_changes = committed || ahead_before_commit > 0;
     require_success(
         run_git(repository, &["fetch", "--prune", "origin"])?,
         "拉取远端引用",
@@ -538,7 +516,10 @@ where
     let local_is_ancestor = is_ancestor(repository, "HEAD", &upstream_oid)?;
     let upstream_is_ancestor = is_ancestor(repository, &upstream_oid, "HEAD")?;
     match (local_is_ancestor, upstream_is_ancestor) {
-        (true, true) => Ok(PullOutcome { updated: false }),
+        (true, true) | (false, true) => Ok(PullOutcome {
+            updated: false,
+            has_local_changes,
+        }),
         (true, false) => {
             validate_commit_documents(repository, &upstream_oid)?;
             after_validation()?;
@@ -546,20 +527,20 @@ where
                 run_git(repository, &["merge", "--ff-only", &upstream_oid])?,
                 "快进本地分支",
             )?;
-            Ok(PullOutcome { updated: true })
+            Ok(PullOutcome {
+                updated: true,
+                has_local_changes,
+            })
         }
-        (false, true) => Err(AppError::new(
-            "LOCAL_COMMITS",
-            "当前分支包含尚未推送的本地提交，拉取已停止。",
-            "先推送本地提交后再拉取。",
-            false,
-        )),
-        (false, false) => Err(AppError::new(
-            "GIT_DIVERGED",
-            "本地分支与远端已经分叉，应用不会自动合并。",
-            "在系统终端处理分叉并恢复干净工作区后重试。",
-            false,
-        )),
+        (false, false) => {
+            validate_commit_documents(repository, &upstream_oid)?;
+            after_validation()?;
+            rebase_onto_validated_upstream(repository, &upstream_oid)?;
+            Ok(PullOutcome {
+                updated: true,
+                has_local_changes,
+            })
+        }
     }
 }
 

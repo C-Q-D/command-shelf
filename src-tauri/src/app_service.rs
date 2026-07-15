@@ -184,9 +184,9 @@ impl AppService {
         ))
     }
 
-    /// 从当前分支上游安全拉取，并校验同一固定提交中的全部受管数据文件。
+    /// 从当前分支上游安全拉取，并在保留本地数据提交的前提下校验和接入远端更新。
     ///
-    /// 副作用：会刷新 `origin` 远端引用；快进后不再运行可能把成功误报成失败的磁盘或状态查询。
+    /// 副作用：会刷新 `origin` 远端引用；接入远端后不再运行可能把成功误报成失败的 Git 状态查询。
     pub fn pull_repository(&self) -> Result<AppSnapshot, AppError> {
         let config = load_config(&self.config_directory)?.ok_or_else(|| {
             AppError::new(
@@ -211,11 +211,18 @@ impl AppService {
         if inbox_path.exists() {
             load_inbox_document(&inbox_path)?;
         }
-        let mut snapshot = success_snapshot(repository, document, document_hash, false, false);
-        snapshot.status_message = if outcome.updated {
-            "已拉取并加载远端最新命令。"
-        } else {
-            "本地数据已经是远端最新版本。"
+        let mut snapshot = success_snapshot(
+            repository,
+            document,
+            document_hash,
+            false,
+            outcome.has_local_changes,
+        );
+        snapshot.status_message = match (outcome.updated, outcome.has_local_changes) {
+            (true, true) => "已接入远端更新，本地修改仍待推送。",
+            (true, false) => "已拉取并加载远端最新命令。",
+            (false, true) => "远端没有新更新，本地修改仍待推送。",
+            (false, false) => "本地数据已经是远端最新版本。",
         }
         .to_string();
         Ok(snapshot)
@@ -1114,27 +1121,87 @@ mod tests {
         assert_eq!(saved.document, edited);
     }
 
-    /// 验证未提交本地文件会在 fetch 前停止，数据文件和提交均保持不变。
+    /// 验证本地命令修改与远端 Inbox 更新并存时，拉取会接入远端并保留待推送的本地提交。
     #[test]
-    fn stops_pull_when_local_document_is_dirty() {
+    fn rebases_remote_update_while_preserving_local_changes() {
         let directory = tempfile::tempdir().expect("应能创建测试目录");
         let repository = cloned_repository(directory.path());
+        fs::write(
+            repository.join("commands.json"),
+            document_json("本地基线命令"),
+        )
+        .expect("应能写入本地基线");
+        commit_and_push_document(&repository, "加入本地基线");
         let service = AppService::new(directory.path().join("config"));
         let connected = service
             .choose_repository(repository.to_string_lossy().as_ref())
             .expect("首次连接应成功");
-        let before = fs::read(repository.join("commands.json")).expect("应能读取本地文档");
+        let producer = directory.path().join("producer");
+        git(
+            directory.path(),
+            &[
+                "clone",
+                directory
+                    .path()
+                    .join("remote.git")
+                    .to_string_lossy()
+                    .as_ref(),
+                "producer",
+            ],
+        );
+        fs::write(
+            producer.join("inbox.json"),
+            serialize_inbox_document(&InboxDocument::empty()).expect("空 Inbox 应能序列化"),
+        )
+        .expect("应能写入远端 Inbox 更新");
+        commit_and_push_inbox(&producer, "制造不冲突的远端更新");
+        service
+            .save_document(
+                edited_document(),
+                connected
+                    .document_hash
+                    .as_deref()
+                    .expect("连接快照应有哈希"),
+            )
+            .expect("本地命令修改应能保存");
+
+        let pulled = service
+            .pull_repository()
+            .expect("不冲突的远端更新应自动接入");
+
+        assert_eq!(pulled.sync_state, SyncState::Dirty);
+        assert_eq!(pulled.document, edited_document());
+        assert_eq!(
+            git_output(&repository, &["rev-list", "--count", "@{u}..HEAD"]),
+            "1",
+            "拉取后本地数据提交应等待用户主动推送"
+        );
+        assert_eq!(
+            load_inbox_document(&repository.join("inbox.json"))
+                .expect("拉取后应加载远端 Inbox")
+                .0,
+            InboxDocument::empty()
+        );
+    }
+
+    /// 验证拉取仍拒绝受管数据之外的工作区变化，不会把其他文件带入自动提交。
+    #[test]
+    fn refuses_to_pull_unrelated_worktree_changes() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        let service = AppService::new(directory.path().join("config"));
+        service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("首次连接应成功");
+        fs::write(repository.join("notes.txt"), "不属于应用的数据").expect("应能创建无关文件");
+        let before_head = git_output(&repository, &["rev-parse", "HEAD"]);
 
         let error = service
             .pull_repository()
-            .expect_err("本地未提交文档不得被拉取覆盖");
+            .expect_err("无关工作区变化必须阻止拉取");
 
-        assert_eq!(error.code, "LOCAL_CHANGES");
-        assert_eq!(
-            fs::read(repository.join("commands.json")).expect("应能再次读取本地文档"),
-            before
-        );
-        assert_eq!(connected.document, CommandDocument::empty());
+        assert_eq!(error.code, "WORKTREE_DIRTY");
+        assert_eq!(git_output(&repository, &["rev-parse", "HEAD"]), before_head);
     }
 
     /// 验证远端候选 JSON 无效时只更新远端引用，不快进 HEAD 或覆盖本地文件。
