@@ -1360,9 +1360,9 @@ mod tests {
         assert_eq!(no_op.sync_state, SyncState::Synced);
     }
 
-    /// 验证真实本地连接拒绝只让推送失败，文档字节、哈希、Git 状态与重启数据保持不变。
+    /// 验证真实本地连接拒绝会保留安全本地提交，文档字节、哈希与重启数据保持不变。
     #[test]
-    fn preserves_document_when_loopback_remote_refuses_connection() {
+    fn preserves_document_and_local_commit_when_loopback_remote_refuses_connection() {
         let directory = tempfile::tempdir().expect("应能创建测试目录");
         let repository = cloned_repository(directory.path());
         let config_directory = directory.path().join("config");
@@ -1382,10 +1382,6 @@ mod tests {
         let saved_hash = saved.document_hash.clone().expect("保存快照应有哈希");
         let before_bytes = fs::read(repository.join("commands.json")).expect("应能读取保存文档");
         let before_head = git_output(&repository, &["rev-parse", "HEAD"]);
-        let before_status = git_output(
-            &repository,
-            &["status", "--porcelain=v1", "--", "commands.json"],
-        );
         let original_origin = git_output(&repository, &["remote", "get-url", "origin"]);
 
         // 先由系统分配空闲端口再关闭监听器，紧接着访问可稳定得到本机连接拒绝而不依赖互联网。
@@ -1406,13 +1402,19 @@ mod tests {
             fs::read(repository.join("commands.json")).unwrap(),
             before_bytes
         );
-        assert_eq!(git_output(&repository, &["rev-parse", "HEAD"]), before_head);
+        assert_ne!(git_output(&repository, &["rev-parse", "HEAD"]), before_head);
         assert_eq!(
             git_output(
                 &repository,
                 &["status", "--porcelain=v1", "--", "commands.json"],
             ),
-            before_status
+            "",
+            "联网失败前创建的安全提交不应残留工作区修改"
+        );
+        assert_eq!(
+            git_output(&repository, &["rev-list", "--count", "@{u}..HEAD"]),
+            "1",
+            "网络恢复后应能直接重试推送本地提交"
         );
         let (disk_document, disk_hash) =
             load_document(&repository.join("commands.json")).expect("失败后文档仍应有效");
